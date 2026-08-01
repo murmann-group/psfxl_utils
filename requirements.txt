@@ -1,0 +1,6 @@
+numpy
+blosc
+packaging
+# numcodecs is an alternative to blosc on systems where blosc wheels are
+# unavailable (e.g. some HPC environments). Only one of the two is required.
+# numcodecs
