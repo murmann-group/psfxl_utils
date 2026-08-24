@@ -285,7 +285,10 @@ def parse_sig_file(sig_path):
 def _scan_chunk_headers(data):
     """Pre-scan the PSFXL file for all valid chunk headers.
 
-    Returns list of (offset, seq, num_points, chunk_size) tuples, sorted by offset.
+    Returns list of (offset, data_start, seq, num_points, chunk_size, flag, ref)
+    tuples, sorted by offset. `flag` is the encoding byte Spectre writes for the
+    chunk and `ref` is the trailing `<back_offset>.<length>` field that
+    accompanies a back-reference; both are needed to decode correctly.
     """
     chunks = []
     pos = 0
@@ -303,7 +306,9 @@ def _scan_chunk_headers(data):
             if '.' in size_field:
                 size_field = size_field.split('.')[0]
             chunk_size = int(size_field, 16)
-            chunks.append((idx, nl + 1, seq, num_points, chunk_size))
+            flag = parts[5] if len(parts) > 5 else ''
+            ref = parts[7] if len(parts) > 7 else ''
+            chunks.append((idx, nl + 1, seq, num_points, chunk_size, flag, ref))
         except (ValueError, IndexError):
             pass
         pos = idx + 1
@@ -440,14 +445,39 @@ def decode_psfxl(data_path, num_traces):
     flush_count = 0
 
     # Pass 2: process each chunk in order
-    for offset, data_start, seq, num_points, chunk_size in chunks:
+    for offset, data_start, seq, num_points, chunk_size, flag, ref in chunks:
         if num_points == 0:
             continue
 
-        # Handle zero-size chunks: signal is constant (all zeros)
+        # A zero-size chunk is NOT a run of zeros. Spectre writes it when this
+        # signal's data for this flush is byte-identical to a block already in
+        # the file -- two clock phases with the same duty, a bus whose bits
+        # carry the same code -- and points at that block with a trailing
+        # `<back_offset>.<length>` field: the block starts `back_offset` bytes
+        # before this chunk header and its compressed size is `length`.
+        # Filling zeros here silently replaces a real waveform with a flat
+        # line, and only for signals that happen to duplicate another one.
         if chunk_size == 0:
-            if 0 < seq < num_traces:
-                all_signals[seq].append(np.zeros(num_points, dtype='<f8'))
+            if 0 <= seq < num_traces and ref:
+                try:
+                    back = int(ref.split('.')[0], 16)
+                    src = offset - back
+                    if src >= 0:
+                        cbytes = struct.unpack_from('<I', data, src + 12)[0]
+                        vals = np.frombuffer(
+                            _blosc_decompress(data[src:src + cbytes]),
+                            dtype='<f8')
+                        if len(vals) == num_points:
+                            all_signals[seq].append(vals)
+                            continue
+                except Exception:
+                    pass
+            warnings.warn(
+                "psfxl chunk for signal {} at offset {} (flag {!r}, ref {!r}) "
+                "has zero size and its back-reference could not be resolved; "
+                "the signal is left short rather than filled with zeros"
+                .format(seq, offset, flag, ref),
+                RuntimeWarning)
             continue
 
         # Handle 8-byte constant chunks: DC value stored as a single raw
@@ -525,6 +555,17 @@ def decode_psfxl(data_path, num_traces):
                 # fingerprint so we don't mis-pick an unrelated block.
                 sig_expected_nbytes = num_points * 8
                 sig_start_nominal = blosc_pos + h0[6]
+                # Trace 0 rides in this chunk after the time block, encoded the
+                # same way any signal is. When it is constant Spectre stores a
+                # single inline double rather than a blosc block, and the
+                # declared chunk size exceeds the time block by exactly 8
+                # bytes. Searching only for a blosc header misses that and
+                # drops trace 0 with no diagnostic.
+                if chunk_size - h0[6] == 8:
+                    val = struct.unpack_from('<d', data, sig_start_nominal)[0]
+                    all_signals[0].append(np.full(num_points, val, dtype='<f8'))
+                    flush_count += 1
+                    continue
                 sig_start = _find_blosc_header(
                     data, sig_start_nominal, sig_start_nominal + 32, sig_expected_nbytes
                 )
