@@ -13,6 +13,54 @@ is located automatically next to the header.
 
 ---
 
+## Seeing what a file holds
+
+Every public object reports itself, so probing an unfamiliar result needs no
+prior knowledge of the API — useful at a REPL, in a one-off script, or to an
+agent with shell access:
+
+```python
+>>> psf = PSF('results/psf/tran.tran')
+>>> psf
+<PSF 'tran.tran': 13 signals, sweep 'time' [s] × 594 points;
+ vout, vin, clk, vdd, … (+9 more)>
+
+>>> psf.get_sweep()
+<Sweep 'time' [s]: 594 points, 0 … 0.000229 (float64)>
+
+>>> psf.get_signal('vout')
+<Signal 'vout' [V]: 594 points, 0 … 1.798 (float64)>
+
+>>> PSF('results/psf/dcOp.dc')
+<PSF 'dcOp.dc': 112 signals, no sweep (operating-point snapshot);
+ M0:region, M0:trise, M0:dtemp, M0:reversed, … (+108 more)>
+
+>>> PSF('results/psf/dcOp.dc').get_signal('M0:ids')
+<Signal 'M0:ids' [A]: 1 point, 1.234e-05>
+```
+
+`print()` gives the same text — `__str__` falls back to `__repr__`.
+
+Only names, array lengths and the two endpoint values are read, so a `repr`
+stays cheap on a multi-million-point transient.
+
+An array that decoded to nothing is reported as `EMPTY (no data decoded)`
+rather than `0 points`, and a `PSF` whose signals are *all* empty says so
+outright:
+
+```python
+>>> psf
+<PSF 'tran.tran': 13 signals, sweep 'time' [s] × 0 points;
+ vout, vin, clk, vdd, … (+9 more) — EMPTY: every signal decoded to zero points>
+```
+
+That combination — a correct signal count and correct names over no data at
+all — is what an unrecognised chunk container looks like, so it is worth
+being able to spot at a glance. `decode_psfxl()` also warns in that case; see
+[format.md](format.md).
+
+---
+
 ## Listing available signals
 
 Works the same for every analysis type:

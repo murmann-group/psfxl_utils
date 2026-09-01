@@ -134,7 +134,7 @@ Two transparent layers, both managed by `PSF.__init__`:
 | Layer | Store | Invalidation |
 |-------|-------|--------------|
 | Memory (per process) | `PSF._instance_cache` dict | SHA-256 hash of the source file, recomputed on every hit |
-| Disk (across sessions) | `~/.cache/psfxl_utils/*.pkl` | nanosecond mtime embedded in the cache filename |
+| Disk (across sessions) | `~/.cache/psfxl_utils/*.pkl` | nanosecond mtime **and** library source hash, both embedded in the cache filename |
 
 **Memory layer.** Keyed by resolved path. On every lookup the source file is
 re-hashed; a hash mismatch (file changed on disk) forces a reload. This makes
@@ -142,13 +142,24 @@ repeated loads within one process cost only the hash pass (< 1 ms for typical
 files) instead of a full decode.
 
 **Disk layer.** Cache filenames have the form
-`<stem>_<path-md5-prefix>_<mtime_ns>.pkl`. The MD5-of-path prefix only
-disambiguates identically named files from different directories (it is not
-an integrity check); the nanosecond mtime makes any modification of the
+`<stem>_<path-md5-prefix>_<lib-hash>_<mtime_ns>.pkl`. The MD5-of-path prefix
+only disambiguates identically named files from different directories (it is
+not an integrity check); the nanosecond mtime makes any modification of the
 source file — including rewrites within the same second — miss the cache and
-trigger a re-decode. When a new cache entry is written, entries for older
-mtimes of the same source file are deleted, so the directory does not grow
-without bound. `clear_all()` wipes the whole cache directory.
+trigger a re-decode.
+
+`<lib-hash>` is `psf_cache.LIB_HASH`, an MD5 prefix over the source of every
+`.py` in the package, computed once at import. It makes a library change
+invalidate the cache too. Without it, a decoder fix silently does nothing on
+any file already cached: `decode_psfxl()` returns the corrected waveform while
+`PSF()` keeps serving the pre-fix pickle for the same path and mtime, and the
+only way out is deleting `~/.cache/psfxl_utils` by hand. Hashing the source
+rather than a declared version number also covers uncommitted local edits.
+
+When a new cache entry is written, entries for older mtimes *and* older
+library hashes of the same source file are deleted, so neither repeated
+simulation nor repeated upgrades let the directory grow without bound.
+`clear_all()` wipes the whole cache directory.
 
 Corrupted or unreadable cache files are treated as cache misses; cache write
 failures are silently ignored (the decode result is still returned).

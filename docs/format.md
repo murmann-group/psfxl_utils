@@ -118,15 +118,74 @@ than a fixed magic pattern.
 
 Payload after decompression: `num_points` little-endian float64 values.
 
-### Constant chunks
+### Constant and back-referenced chunks
 
-- `chunk_size == 0` — the signal is 0.0 for the whole flush.
+- `chunk_size == 0` — **not** a run of zeros. Spectre writes it when this
+  signal's data for this flush is byte-identical to a block already in the
+  file (two clock phases with the same duty, a bus whose bits carry the same
+  code) and points at that block with a trailing `<back_offset>.<length>`
+  field: the block starts `back_offset` bytes before this chunk header and
+  its compressed size is `length`. Filling zeros here would silently replace
+  a real waveform with a flat line.
 - `chunk_size == 8` — a constant (DC) value stored as one raw double,
   preceded by a 1–8 byte null pad to the next 8-byte file offset. The pad is
   always emitted, even when the position is already aligned, so the skip is
   `8 - (offset % 8)` (never 0). Skipping *all* nulls instead would corrupt
   signals whose constant value is 0.0 and could swallow the next chunk
   header's leading null byte.
+
+### Type-1 chunk (uncompressed, no index table)
+
+ASCII header `\x001:seq:?:num_points:binary_size\n` (hex fields), followed by
+an alignment pad, then raw little-endian doubles grouped as
+`(num_traces + 1)` blocks of `num_points`: time first, then each signal — the
+same grouped payload as a type-2 chunk.
+
+Spectre writes a single type-1 chunk covering the whole flush when the data
+compresses badly enough that it does not use the per-signal blosc-compressed
+type-3 blocks. **The container is chosen by how well the data compresses, not
+by how many signals were saved** — adding one save changes the data, and the
+data changes the container, so the same circuit can produce type-3 at 13
+signals and type-1 at 14, or the reverse.
+
+Two differences from type-2, both of which corrupt a decode if missed:
+
+1. **No `num_traces` field.** The header has five fields, not six. Derive it:
+
+   ```
+   num_traces = binary_size / 8 / num_points - 1
+   ```
+
+   e.g. `\x001:0:ffffffffffffffff:252:103e0` is `0x252` = 594 points and
+   `0x103e0` = 66528 bytes = `(13 + 1) × 594 × 8` — the time axis plus 13
+   signals, uncompressed float64.
+
+2. **No ASCII index table, but there IS an alignment pad.** It follows the
+   same rule as the constant-chunk pad above: `8 - (offset % 8)`, always 1–8
+   bytes, never 0, emitted even when the offset is already 8-byte aligned.
+
+   Do **not** locate the payload by scanning past null bytes the way the
+   type-2 reader does. The first payload value is the first time point, which
+   is legitimately `0.0` and therefore eight null bytes indistinguishable from
+   padding. Scanning past them consumes the start of the time axis, shifting
+   every signal by one sample and dropping the last — and the result still
+   looks plausible, because a shifted time axis is still monotonic and every
+   value is still a real number. The signature is `t[0] == t[1]`, which a
+   monotonicity check does not catch; `_find_type1_chunks()` tests for it
+   explicitly.
+
+Identify a file's containers by their chunk markers:
+
+```bash
+python -c "
+import re, sys
+from collections import Counter
+data = open(sys.argv[1], 'rb').read()
+print(Counter(m.group(1).decode() for m in re.finditer(rb'\x00(\d):', data)))
+" psf/tran1.tran.tran.psfxl
+# {'3': 12}  -> 12 type-3 chunks, one per signal
+# {'1': 1}   -> 1 type-1 chunk, the whole flush
+```
 
 ### Type-2 chunk (uncompressed)
 
@@ -144,6 +203,15 @@ Two kinds of type-2 chunk exist, distinguished only by their content:
   checkpoint redundant. Identified by `first_time <= last type-3 time` and
   skipped (with a warning). Interrupted simulations typically leave one of
   these behind.
+
+### Unrecognised containers
+
+Every branch that drops a chunk does so by skipping it, so a file built from a
+container this decoder does not know would otherwise fall through to an empty
+result with no diagnostic — a well-formed `PSF` with correct signal names and
+every ordinate empty, which callers then compute on. `decode_psfxl()` therefore
+issues a `RuntimeWarning` when it finds no decodable type-1, type-2 or type-3
+block, so an unknown container is visible rather than silent.
 
 ---
 

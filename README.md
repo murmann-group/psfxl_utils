@@ -54,6 +54,34 @@ pip install numcodecs   # instead of blosc
 
 ## Quick Start
 
+### What is in this file?
+
+`PSF`, `Signal` and `Sweep` all have informative `repr`s, so an unfamiliar
+result file identifies itself without any prior knowledge of the API:
+
+```python
+>>> from psfxl_utils import PSF
+>>> psf = PSF('results/psf/tran.tran')
+>>> psf
+<PSF 'tran.tran': 13 signals, sweep 'time' [s] × 594 points;
+ vout, vin, clk, vdd, … (+9 more)>
+
+>>> psf.get_sweep()
+<Sweep 'time' [s]: 594 points, 0 … 0.000229 (float64)>
+
+>>> psf.get_signal('vout')
+<Signal 'vout' [V]: 594 points, 0 … 1.798 (float64)>
+```
+
+A file that parsed but decoded to nothing says so, instead of looking like an
+ordinary result with an unremarkable signal list:
+
+```python
+>>> psf
+<PSF 'tran.tran': 13 signals, sweep 'time' [s] × 0 points;
+ vout, vin, clk, vdd, … (+9 more) — EMPTY: every signal decoded to zero points>
+```
+
 ### DC operating point (scalar access)
 
 ```python
@@ -151,9 +179,11 @@ applied automatically:
 | Layer | Location | Speed | Invalidation |
 |-------|----------|-------|--------------|
 | In-session memory | `PSF._instance_cache` (dict) | < 1 ms | SHA-256 hash of source file |
-| Disk pickle | `~/.cache/psfxl_utils/` | ~50 ms | mtime embedded in filename |
+| Disk pickle | `~/.cache/psfxl_utils/` | ~50 ms | mtime + library source hash, embedded in filename |
 
-Clear the disk cache when it grows stale:
+Upgrading or editing the library changes the source hash, so cache entries
+written by an older build are never reused. Clearing by hand is only needed
+to reclaim disk space:
 
 ```python
 from psfxl_utils.psf_cache import clear_all

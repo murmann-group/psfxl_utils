@@ -82,6 +82,37 @@ from .oppoint_psf_decoder import decode_psf_info
 from . import psf_cache
 
 
+def _fmt_units(units):
+    """Render a unit string for a repr: ``' [V]'``, or ``''`` when unitless."""
+    return f" [{units}]" if units else ""
+
+
+def _fmt_value(v):
+    """Compact numeric rendering for reprs."""
+    try:
+        if np.iscomplexobj(v):
+            return f"{complex(v).real:.4g}{complex(v).imag:+.4g}j"
+        return f"{float(v):.4g}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _fmt_array(arr):
+    """Summarise an array for a repr: length, dtype and endpoints.
+
+    Empty is reported as ``EMPTY`` rather than ``0 points`` because an empty
+    array is a decode failure, not a small result, and the point of these
+    reprs is that it should be impossible to miss.
+    """
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return "EMPTY (no data decoded)"
+    if arr.size == 1:
+        return f"1 point, {_fmt_value(arr.flat[0])}"
+    return (f"{arr.size} points, {_fmt_value(arr.flat[0])} … "
+            f"{_fmt_value(arr.flat[-1])} ({arr.dtype})")
+
+
 class _SignalType:
     def __init__(self, kind='float'):
         self.kind = kind
@@ -136,6 +167,16 @@ class Signal:
         kind = 'complex' if np.iscomplexobj(ordinate) else 'float'
         self.type = _SignalType(kind)
 
+    def __repr__(self):
+        """One-line summary: name, units, length, dtype and endpoints.
+
+        ``__str__`` falls back to this, so ``print(signal)`` is informative
+        too.  Reads only the first and last element, so it stays cheap on
+        multi-million-point transients.
+        """
+        return (f"<Signal {self.name!r}{_fmt_units(self.units)}: "
+                f"{_fmt_array(self.ordinate)}>")
+
 
 class Sweep:
     """
@@ -178,6 +219,19 @@ class Sweep:
         self.units = units
         self.abscissa = abscissa
 
+    def __repr__(self):
+        """One-line summary: axis name, units, length and endpoints.
+
+        ``__str__`` falls back to this.  An op-point file has no sweep at
+        all, which shows as ``<Sweep (none)>``.
+        """
+        # An op-point file has no sweep: the header names no axis and the
+        # decoders hand back a length-1 placeholder, not an empty array.
+        if not self.name and np.asarray(self.abscissa).size <= 1:
+            return "<Sweep (none) — operating-point snapshot>"
+        return (f"<Sweep {self.name!r}{_fmt_units(self.units)}: "
+                f"{_fmt_array(self.abscissa)}>")
+
 
 class PSF:
     """
@@ -202,8 +256,23 @@ class PSF:
         - ``"results/psf0/ac.ac"``      — AC small-signal analysis
         - ``"results/psf0/ac.noise"``   — noise spectral density
 
+    Attributes
+    ----------
+    path : pathlib.Path
+        Resolved absolute path of the loaded header file.
+
     Examples
     --------
+    **Quick look at an unfamiliar file** — ``repr`` reports the signal count,
+    the sweep axis and a sample of signal names, so no prior knowledge of the
+    file is needed to see what is in it:
+
+    .. code-block:: python
+
+        >>> PSF("results/psf0/tran.tran")
+        <PSF 'tran.tran': 13 signals, sweep 'time' [s] × 594 points;
+         vout, vin, clk, vdd, … (+9 more)>
+
     **DC operating-point — scalar signal access:**
 
     .. code-block:: python
@@ -294,6 +363,10 @@ class PSF:
         """
         path = Path(path).resolve()
         path_str = str(path)
+        # Set before the cache branches below, all three of which return
+        # early; `path` names the file in __repr__ and is derived from the
+        # constructor argument, never from a cached object.
+        self.path = path
 
         # Level 1: in-session memory cache (hash-validated to detect file changes).
         if path_str in PSF._instance_cache:
@@ -386,6 +459,57 @@ class PSF:
         # Re-emit captured warnings now that the object is fully built and cached.
         for msg, cat in self._decode_warnings:
             warnings.warn(msg, cat, stacklevel=2)
+
+    #: Number of signal names listed in ``repr(psf)`` before eliding the rest.
+    _REPR_SIGNAL_SAMPLE = 4
+
+    def __repr__(self):
+        """One-line summary of the file: signal count, sweep axis, sample names.
+
+        ``__str__`` falls back to this, so ``print(psf)`` is informative too.
+        The point is that neither an agent nor a person should have to already
+        know to call :meth:`all_signals` before it can tell what a file holds::
+
+            <PSF 'tran.tran': 13 signals, sweep 'time' [s] × 594 points;
+             vout, vin, clk, vdd, … (+9 more)>
+
+        A file that decoded to nothing says so explicitly rather than looking
+        like a normal result with an unremarkable signal list — the failure
+        mode that made the type-1 chunk bug expensive to find.
+
+        Only signal names and array lengths are touched, so this stays cheap
+        on multi-million-point transients.
+        """
+        name = getattr(self, 'path', None)
+        head = f"<PSF {name.name!r}: " if name is not None else "<PSF: "
+
+        signals = getattr(self, '_signals', [])
+        parts = [f"{len(signals)} signal{'' if len(signals) == 1 else 's'}"]
+
+        sweep = getattr(self, '_sweep', None)
+        n_sweep = np.asarray(sweep.abscissa).size if sweep is not None else 0
+        if sweep is None or (not sweep.name and n_sweep <= 1):
+            parts.append("no sweep (operating-point snapshot)")
+        else:
+            parts.append(f"sweep {sweep.name!r}{_fmt_units(sweep.units)} "
+                         f"× {n_sweep} point{'' if n_sweep == 1 else 's'}")
+
+        summary = head + ", ".join(parts)
+
+        if signals:
+            shown = [s.name for s in signals[:self._REPR_SIGNAL_SAMPLE]]
+            listing = ", ".join(shown)
+            remaining = len(signals) - len(shown)
+            if remaining:
+                listing += f", … (+{remaining} more)"
+            summary += "; " + listing
+
+        # An empty decode is a failure, not a small result.  Say so where it
+        # cannot be scrolled past.
+        if signals and all(np.asarray(s.ordinate).size == 0 for s in signals):
+            summary += " — EMPTY: every signal decoded to zero points"
+
+        return summary + ">"
 
     def all_signals(self):
         """

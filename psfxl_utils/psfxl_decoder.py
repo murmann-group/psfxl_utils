@@ -366,6 +366,73 @@ def _find_type2_chunks(data):
     return chunks
 
 
+def _find_type1_chunks(data):
+    """Find type-1 chunk headers (uncompressed, no index table).
+
+    Type-1 format: \x001:seq:?:num_points:binary_size\n
+    Followed by an 8-byte alignment pad, then raw little-endian IEEE 754
+    doubles laid out as (num_traces+1) groups of num_points values
+    (time + each signal) -- the same grouped payload as type-2.
+
+    Spectre writes a single type-1 chunk for the whole flush when the data
+    compresses badly enough that it does not use the per-signal
+    blosc-compressed type-3 blocks.  The container is chosen by how well the
+    data compresses, not by how many signals were saved.
+
+    Two differences from type-2, both of which corrupt a decode if missed:
+
+    1. There is no ``num_traces`` field -- the header has five fields, not
+       six -- so it is derived: ``binary_size / 8 / num_points - 1``.
+
+    2. There is no ASCII index table, but there IS an alignment pad of
+       ``8 - (offset % 8)`` bytes: always 1-8, never 0, emitted even when the
+       offset is already 8-byte aligned.  Do *not* locate the payload by
+       scanning past null bytes the way the type-2 reader does: the first
+       payload value is the first time point, which is legitimately ``0.0``
+       and therefore eight null bytes indistinguishable from padding.
+       Scanning past them consumes the start of the time axis, shifting every
+       signal by one sample and dropping the last.
+
+    Returns ``(doubles_start, num_traces, num_points, binary_size)`` tuples
+    shaped to match :func:`_find_type2_chunks`, so the existing filter and
+    consumer handle them unchanged.
+    """
+    chunks = []
+    pos = 0
+    while True:
+        idx = data.find(b'\x001:', pos)
+        if idx == -1:
+            break
+        try:
+            nl = data.index(b'\n', idx, idx + 300)
+            parts = data[idx+1:nl].decode('ascii', errors='replace').split(':')
+            if len(parts) >= 5:
+                num_points = int(parts[3], 16)
+                binary_size = int(parts[4], 16)
+                stride = 8 * num_points
+                if num_points > 0 and stride and binary_size % stride == 0:
+                    groups = binary_size // stride
+                    after_nl = nl + 1
+                    align_skip = 8 - (after_nl % 8)   # always 1-8, never 0
+                    doubles_start = after_nl + align_skip
+                    if groups >= 2 and doubles_start + binary_size <= len(data):
+                        # Structural check: the first group is the time axis.
+                        # Require it to be non-decreasing AND to have no
+                        # duplicated leading sample -- an off-by-one in the
+                        # pad shows up exactly as t[0] == t[1], and a plain
+                        # monotonicity test does not catch it.
+                        t = np.frombuffer(data[doubles_start:doubles_start + stride],
+                                          dtype='<f8')
+                        if (t.size == num_points and np.all(np.diff(t) >= 0)
+                                and (num_points < 2 or t[0] != t[1])):
+                            chunks.append((doubles_start, groups - 1,
+                                           num_points, binary_size))
+            pos = nl + 1 if nl > idx else idx + 1
+        except (ValueError, IndexError):
+            pos = idx + 1
+    return chunks
+
+
 def _filter_type2_chunks(type2_chunks, data, last_t3_time):
     """Classify type-2 chunks as final flushes or stale intermediate checkpoints.
 
@@ -638,7 +705,10 @@ def decode_psfxl(data_path, num_traces):
     # time value and comparing it to the decoded type-3 range.  This is a
     # purely data-driven check — it makes no assumptions about file layout or
     # byte offsets and is therefore robust to any ordering Spectre may use.
-    type2_candidates = _find_type2_chunks(data)
+    # Type-1 chunks carry the same grouped payload as type-2 and are
+    # classified by the same first-time-value rule, so both are gathered
+    # here and filtered together.
+    type2_candidates = _find_type2_chunks(data) + _find_type1_chunks(data)
     last_t3_time = all_time[-1][-1] if all_time else -np.inf
     type2_chunks, skipped_times = _filter_type2_chunks(type2_candidates, data, last_t3_time)
 
@@ -661,6 +731,20 @@ def decode_psfxl(data_path, num_traces):
         for sig_idx in range(min(nt2, num_traces)):
             all_signals[sig_idx].append(groups[1 + sig_idx])
         flush_count += 1
+
+    if not all_time:
+        # Every earlier branch that drops a chunk does so with `continue`,
+        # so an unrecognised container leaves us here with nothing and no
+        # other diagnostic.  Returning an empty array quietly is the worst
+        # outcome: the caller sees a well-formed PSF with correct signal
+        # names and every ordinate empty, and computes on it.
+        warnings.warn(
+            "psfxl: no decodable waveform chunks found in {} ({} bytes). "
+            "The file was parsed but contained no type-1, type-2 or type-3 "
+            "data block this decoder recognises, so the result is empty "
+            "rather than wrong. Check the chunk markers before trusting "
+            "any measurement taken from it.".format(data_path, len(data)),
+            RuntimeWarning, stacklevel=3)
 
     # Concatenate arrays
     time_full = np.concatenate(all_time) if all_time else np.array([])
