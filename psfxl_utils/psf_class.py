@@ -235,6 +235,30 @@ class Sweep:
                 f"{_fmt_array(self.abscissa)}>")
 
 
+def _psfxl_data_path(path, header):
+    """Return the ``.psfxl`` data file for a 0x400 header, or raise.
+
+    Classic *windowed* binary PSF shares the 0x400 magic but stores its data
+    in the header file itself, with a non-zero ``PSF window size`` (PSFXL
+    headers carry the property with value 0).  Spectre writes some results
+    this way even under ``-format psfxl`` (e.g. PSS time-domain output).
+    """
+    window = header.get('header_props', {}).get('PSF window size', 0)
+    if isinstance(window, (int, float)) and window > 0:
+        raise ValueError(
+            f"{path}: classic windowed binary PSF (PSF window size {window}, "
+            f"data stored in this file) is not supported by psfxl_utils. "
+            f"Spectre writes some results in this format even with -format "
+            f"psfxl (e.g. PSS time-domain output); read it with OCEAN or "
+            f"ViVA in Virtuoso.")
+    data_path = Path(str(path) + '.psfxl')
+    if not data_path.exists():
+        raise FileNotFoundError(
+            f"{path}: PSFXL waveform data file {data_path.name} is missing "
+            f"(deleted, not copied with the header, or not yet written)")
+    return data_path
+
+
 class PSF:
     """
     High-level reader for Cadence Spectre PSF simulation results.
@@ -422,7 +446,7 @@ class PSF:
                     time_arr, signals = decode_psf_flat(path, header)
                 else:
                     # PSFXL: signal data is stored in a companion .psfxl file.
-                    data_path = Path(str(path) + '.psfxl')
+                    data_path = _psfxl_data_path(path, header)
                     time_arr, signals, _ = decode_psfxl(data_path, len(traces))
 
         # Store captured warnings as (message_str, category) so they survive
