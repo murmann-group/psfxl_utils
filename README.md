@@ -96,9 +96,13 @@ warned.
 ```python
 from psfxl_utils import PSF
 
-psf = PSF('results/psf/dcOp.dc')
+# Node voltages and terminal currents: dcOp.dc
+op  = PSF('results/psf/dcOp.dc')
+vout = op.get_signal('vout').ordinate[0]
 
-vgs = psf.get_signal('vgs').ordinate[0]
+# Device parameters: dcOpInfo.info, named <instance>.<parameter>
+dev = PSF('results/psf/dcOpInfo.info')
+vgs = dev.get_signal('M0.vgs').ordinate[0]
 print(f"Vgs = {vgs:.4f} V")
 
 for signal in psf.all_signals():
@@ -114,7 +118,7 @@ sweep = psf.get_sweep()          # time axis
 vout  = psf.get_signal('vout')   # voltage array
 ```
 
-### AC / noise (complex signals)
+### AC (complex signals) and noise (real)
 
 ```python
 import numpy as np
@@ -124,6 +128,10 @@ sweep = psf.get_sweep()               # frequency axis (Hz)
 vout  = psf.get_signal('vout')        # complex ordinate
 
 gain_db = 20 * np.log10(np.abs(vout.ordinate))
+
+noise = PSF('results/psf/noise.noise')
+onoise = noise.get_signal('out')      # real (V^2/Hz); per-device terms are
+                                      # 'M0' (total) and 'M0.<mechanism>'
 ```
 
 More examples — plotting, device operating-point tables, Monte Carlo
@@ -207,8 +215,9 @@ arrays) stays until its result file is loaded again in a changed state, or
 until `clear_all()`.
 
 Upgrading or editing the library changes the source hash, so cache entries
-written by an older build are never reused. Clearing by hand is only needed
-to reclaim disk space:
+written by an older build are never reused; they are only deleted when the same
+result file is loaded again. After an upgrade, clear the cache once to reclaim
+that space:
 
 ```python
 from psfxl_utils.psf_cache import clear_all

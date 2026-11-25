@@ -5,7 +5,8 @@ Defines the three public data classes that represent decoded Cadence Spectre
 PSF simulation results:
 
 - :class:`PSF`    — top-level file reader; entry point for all PSF access.
-- :class:`Signal` — a single decoded trace (voltage, current, or complex quantity).
+- :class:`Signal` — a single decoded trace: real (transient, DC, noise) or
+  complex (AC, stability).
 - :class:`Sweep`  — the independent axis (time, frequency, DC parameter, etc.).
 
 Supported PSF Formats
@@ -49,10 +50,11 @@ Example
     from psfxl_utils import PSF
 
     # --- DC operating-point (single scalar per signal) ---
-    psf = PSF("results/psf0/dcOp.dc")
+    psf = PSF("results/psf0/dcOp.dc")              # node voltages
     for signal in psf.all_signals():
         print(f"{signal.name:<20} {signal.ordinate[0]:.6g} {signal.units}")
-    vgs = psf.get_signal("vgs").ordinate[0]
+    dev = PSF("results/psf0/dcOpInfo.info")        # device parameters
+    vgs = dev.get_signal("M0.vgs").ordinate[0]
 
     # --- Transient sweep ---
     psf   = PSF("results/psf0/tran.tran")
@@ -152,8 +154,8 @@ class Signal:
     --------
     .. code-block:: python
 
-        signal = psf.get_signal("vgs")
-        print(signal.name)           # 'vgs'
+        signal = psf.get_signal("M0.vgs")
+        print(signal.name)           # 'M0.vgs'
         print(signal.units)          # 'V'
         print(signal.ordinate[0])    # scalar value for a DC op-point
         print(signal.type.kind)      # 'float'
@@ -183,7 +185,8 @@ class Sweep:
 
     Returned by :meth:`PSF.get_sweep`.  For transient analyses the axis is
     time; for AC/noise it is frequency; for DC parameter sweeps it is the
-    swept variable value.  For DC operating-point files the sweep is empty.
+    swept variable value.  For DC operating-point files the sweep is a
+    single placeholder point, ``[0.0]``.
 
     Parameters
     ----------
@@ -278,8 +281,8 @@ class PSF:
 
         from psfxl_utils import PSF
 
-        psf = PSF("results/psf0/dcOp.dc")
-        vgs = psf.get_signal("vgs").ordinate[0]
+        psf = PSF("results/psf0/dcOpInfo.info")
+        vgs = psf.get_signal("M0.vgs").ordinate[0]
         print(f"Vgs = {vgs:.4f} V")
 
     **Inspect all signals:**
@@ -300,8 +303,8 @@ class PSF:
 
         vgs_vals = []
         for run_dir in sorted(Path("mc_results").glob("run_*")):
-            psf = PSF(run_dir / "dcOp.dc")
-            vgs_vals.append(psf.get_signal("vgs").ordinate[0])
+            psf = PSF(run_dir / "dcOpInfo.info")
+            vgs_vals.append(psf.get_signal("M0.vgs").ordinate[0])
 
         mean = np.mean(vgs_vals)
         std  = np.std(vgs_vals)
@@ -532,7 +535,7 @@ class PSF:
         ----------
         name : str
             Exact signal name as stored in the PSF file
-            (e.g., ``'vgs'``, ``'DUT.M1:ids'``).
+            (e.g., ``'vout'``, ``'DUT.M1.ids'``).
 
         Returns
         -------
@@ -549,7 +552,7 @@ class PSF:
         .. code-block:: python
 
             # Scalar access for DC op-point
-            vgs = psf.get_signal("vgs").ordinate[0]
+            vgs = psf.get_signal("M0.vgs").ordinate[0]
 
             # Array access for swept analysis
             vout = psf.get_signal("vout").ordinate   # 1-D NumPy array

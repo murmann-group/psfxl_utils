@@ -39,6 +39,10 @@ agent with shell access:
 <Signal 'M0:ids' [A]: 1 point, 1.234e-05>
 ```
 
+(`dcOp.dc` holds `M0:ids`-style device entries only when operating-point
+data is saved to the rawfile; otherwise it holds node voltages and terminal
+currents, and device parameters are in `dcOpInfo.info` as `M0.ids`.)
+
 `print()` gives the same text — `__str__` falls back to `__repr__`.
 
 Only names, array lengths and the two endpoint values are read, so a `repr`
@@ -160,8 +164,8 @@ vout  = psf.get_signal('vout')    # one value per sweep point
 psf = PSF('results/psf/dcOp.dc')
 
 # Single value per signal; ordinate is a length-1 array.
-vgs = psf.get_signal('vgs').ordinate[0]
-print(f"Vgs = {vgs:.4f} V")
+vout = psf.get_signal('vout').ordinate[0]
+print(f"Vout = {vout:.4f} V")
 ```
 
 ---
@@ -231,8 +235,8 @@ from psfxl_utils import PSF
 
 vgs_vals = []
 for run_dir in sorted(Path('mc_results').glob('run_*')):
-    psf = PSF(run_dir / 'dcOp.dc')
-    vgs_vals.append(psf.get_signal('vgs').ordinate[0])
+    psf = PSF(run_dir / 'dcOpInfo.info')
+    vgs_vals.append(psf.get_signal('M0.vgs').ordinate[0])
 
 print(f"Vgs  mean={np.mean(vgs_vals):.4f} V  std={np.std(vgs_vals):.4f} V")
 ```
