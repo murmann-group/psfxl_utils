@@ -82,3 +82,41 @@ def test_info_strings_are_exposed_separately(tmp_path, monkeypatch):
         psf.get_string('nope')
     psf_class.PSF._instance_cache.clear()
     assert PSF(str(p)).get_string('stb_state') == 'The circuit is stable.'   # disk hit
+
+
+# --- Results are read-only and not shared between instances ----------------
+
+@pytest.fixture
+def psfxl_result(header_file, monkeypatch):
+    fake_header(monkeypatch, 0)
+    (header_file.parent / 'r.tran.tran.psfxl').write_bytes(b'x')
+    monkeypatch.setattr(psf_class, 'decode_psfxl',
+                        lambda p, n: (np.arange(3.0), {0: np.ones(3)}, 1))
+    return header_file
+
+
+def test_ordinates_are_read_only_on_every_path(psfxl_result):
+    first = PSF(str(psfxl_result))                         # decoded
+    memory_hit = PSF(str(psfxl_result))
+    psf_class.PSF._instance_cache.clear()
+    disk_hit = PSF(str(psfxl_result))                      # unpickled
+    for psf in (first, memory_hit, disk_hit):
+        with pytest.raises(ValueError, match='read-only'):
+            psf.get_signal('v').ordinate[0] = 5.0
+        with pytest.raises(ValueError, match='read-only'):
+            psf.get_sweep().abscissa += 1
+    np.testing.assert_array_equal(PSF(str(psfxl_result)).get_signal('v').ordinate, 1.0)
+
+
+def test_copy_is_writable(psfxl_result):
+    y = PSF(str(psfxl_result)).get_signal('v').ordinate.copy()
+    y *= 2
+    assert (y == 2).all()
+
+
+def test_signal_objects_are_not_shared(psfxl_result):
+    first = PSF(str(psfxl_result))
+    first.get_signal('v').name = 'renamed'
+    first.get_signal('renamed').units = 'mV'
+    again = PSF(str(psfxl_result))
+    assert again.get_signal('v').units == 'V'

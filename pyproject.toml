@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "psfxl-utils"
-version = "1.0.2"
+version = "1.1.0"
 description = "Decode Cadence Spectre PSF and PSFXL binary simulation results into NumPy arrays"
 readme = "README.md"
 license = "MIT"

@@ -235,6 +235,39 @@ class Sweep:
                 f"{_fmt_array(self.abscissa)}>")
 
 
+def _read_only(array):
+    """Return *array* (not a copy) marked read-only."""
+    array = np.asarray(array)
+    array.flags.writeable = False
+    return array
+
+
+class _CachedResult:
+    """What the in-session cache holds for one file: its own Signal/Sweep
+    objects, never one of the PSF instances handed to callers."""
+    __slots__ = ('_sweep', '_signals', '_strings', '_decode_warnings')
+
+
+def _take_result(target, source):
+    """Give *target* its own Signal/Sweep objects over *source*'s arrays,
+    marked read-only.
+
+    Instances built from the same file share the arrays (no copy, no extra
+    memory), so the arrays must not be writable: an in-place change through
+    one instance would silently change every other one and every later
+    ``PSF()`` of that file.  The flag is set again here for arrays loaded
+    from the disk cache, because pickling (protocol < 5) drops it.
+    """
+    sweep = source._sweep
+    signals = source._signals
+    target._sweep = Sweep(sweep.name, sweep.units, _read_only(sweep.abscissa))
+    target._signals = [Signal(sig.name, sig.units, _read_only(sig.ordinate))
+                       for sig in signals]
+    target._strings = dict(getattr(source, '_strings', {}))
+    target._decode_warnings = list(getattr(source, '_decode_warnings', []))
+    return target
+
+
 def _psfxl_data_path(path, header):
     """Return the ``.psfxl`` data file for a 0x400 header, or raise.
 
@@ -393,11 +426,9 @@ class PSF:
             cache_entry = PSF._instance_cache[path_str]
             cached = cache_entry['obj']
             if fingerprint is not None and fingerprint == cache_entry['fingerprint']:
-                # Cache hit — copy instance data from the cached object.
-                self._sweep = cached._sweep
-                self._signals = cached._signals
-                self._strings = dict(getattr(cached, '_strings', {}))
-                self._decode_warnings = getattr(cached, '_decode_warnings', [])
+                # Cache hit: own Signal/Sweep objects over the shared,
+                # read-only arrays.
+                _take_result(self, cached)
                 for msg, cat in self._decode_warnings:
                     warnings.warn(msg, cat, stacklevel=2)
                 return
@@ -408,14 +439,11 @@ class PSF:
         cached_psf = (psf_cache.load_from_cache(path_str, cache_path=disk_key)
                       if disk_key is not None else None)
         if cached_psf is not None:
-            self._sweep = cached_psf._sweep
-            self._signals = cached_psf._signals
-            self._strings = dict(getattr(cached_psf, '_strings', {}))
-            self._decode_warnings = getattr(cached_psf, '_decode_warnings', [])
+            _take_result(self, cached_psf)
             # Promote the disk-cache hit into the memory cache.
             if fingerprint is not None:
                 PSF._instance_cache[path_str] = {
-                    'obj': self,
+                    'obj': _take_result(_CachedResult(), self),
                     'fingerprint': fingerprint,
                 }
             for msg, cat in self._decode_warnings:
@@ -471,13 +499,15 @@ class PSF:
                 ordinate=ordinate,
              ))
         
+        _take_result(self, self)          # mark the decoded arrays read-only
+
         # Persist to disk cache for future sessions, then register in memory
         # cache -- each only if the file is unchanged since the keys were taken.
         if disk_key is not None:
             psf_cache.save_to_cache(path_str, self, cache_path=disk_key)
         if fingerprint is not None and psf_cache.source_fingerprint(path_str) == fingerprint:
             PSF._instance_cache[path_str] = {
-                'obj': self,
+                'obj': _take_result(_CachedResult(), self),
                 'fingerprint': fingerprint,
             }
 

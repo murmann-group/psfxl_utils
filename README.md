@@ -82,6 +82,21 @@ ordinary result with an unremarkable signal list:
  vout, vin, clk, vdd, … (+9 more) — EMPTY: every signal decoded to zero points>
 ```
 
+### Results are read-only
+
+Signal and sweep arrays are read-only: every `PSF()` of the same file shares
+them (that is what makes repeat loads instant), so an in-place change would
+silently alter every other result for that file. Assigning into one raises
+`ValueError: assignment destination is read-only`; take a copy first:
+
+```python
+v = psf.get_signal('vout').ordinate.copy()
+v -= v[0]                      # fine on the copy
+```
+
+This is new in 1.1.0; earlier versions returned writable arrays that were
+shared between instances.
+
 ### Incomplete or damaged data
 
 Every signal always has exactly as many points as the sweep. Samples the

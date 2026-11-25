@@ -224,6 +224,13 @@ directory per process. The decoded result never depends on the cache, so
 strict test setups can turn warnings into errors and still exempt caching:
 `-W error -W ignore::psfxl_utils.PSFCacheWarning`.
 
+**Shared, read-only results.** Instances of the same file share the decoded
+arrays, which are therefore marked read-only on every path: after a decode,
+after a disk load (pickling with protocol < 5 drops the flag, so it is set
+again) and on a memory hit. Each instance, and the memory cache itself, has
+its own `Signal`/`Sweep` objects, so changing an attribute on one instance
+does not leak into another.
+
 **Warnings and caching.** Warnings emitted during a decode (e.g. NaN-filled
 chunks) are stored on the PSF object and re-emitted on every cache hit, so
 callers see them regardless of whether the data came from cache.
