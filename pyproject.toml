@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,8 @@ name = "psfxl-utils"
 version = "1.0.1"
 description = "Decode Cadence Spectre PSF and PSFXL binary simulation results into NumPy arrays"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Calvin Lee", email = "cl66@hawaii.edu" },
     { name = "Ashtar Aggelopoulos" },
@@ -24,7 +25,6 @@ keywords = ["cadence", "spectre", "psf", "psfxl", "simulation", "eda", "waveform
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
