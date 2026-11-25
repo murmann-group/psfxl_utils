@@ -82,6 +82,15 @@ ordinary result with an unremarkable signal list:
  vout, vin, clk, vdd, … (+9 more) — EMPTY: every signal decoded to zero points>
 ```
 
+### Incomplete or damaged data
+
+Every signal always has exactly as many points as the sweep. Samples the
+decoder cannot read (a result file cut short, a simulation still writing, a
+block in an unknown encoding) are `NaN`, and a `RuntimeWarning` names the
+affected chunks; nothing is shifted, dropped or borrowed from another signal.
+Check `np.isnan(signal.ordinate).any()` before computing on a result that
+warned.
+
 ### DC operating point (scalar access)
 
 ```python
@@ -178,8 +187,8 @@ applied automatically:
 
 | Layer | Location | Speed | Invalidation |
 |-------|----------|-------|--------------|
-| In-session memory | `PSF._instance_cache` (dict) | < 1 ms | SHA-256 hash of source file |
-| Disk pickle | `$PSFXL_UTILS_CACHE_DIR`, default `~/.cache/psfxl_utils/` | ~50 ms | mtime + library source hash, embedded in filename |
+| In-session memory | `PSF._instance_cache` (dict) | < 1 ms | stat of the result file and its `.psfxl` data file |
+| Disk pickle | `$PSFXL_UTILS_CACHE_DIR`, default `~/.cache/psfxl_utils/` | ~50 ms | same, plus library source hash, embedded in filename |
 
 Set `PSFXL_UTILS_CACHE_DIR` to move the disk cache (for example off a small
 home quota); when it is unset or empty, `~/.cache/psfxl_utils/` is used. Use an
@@ -187,6 +196,15 @@ absolute path to a directory writable only by you: cache entries are pickles,
 so if the directory is someone else's or group/world-writable the disk cache is
 disabled with a warning. If it cannot be created, PSF files still load, just
 without disk caching.
+
+Cache problems are reported as `psfxl_utils.PSFCacheWarning` (a
+`RuntimeWarning` subclass), once per kind and directory. The decoded data never
+depends on the cache, so a strict setup can keep caching warnings out of its
+errors: `python -W error -W ignore::psfxl_utils.PSFCacheWarning`.
+
+The disk cache is not size-limited: an entry (roughly the size of the decoded
+arrays) stays until its result file is loaded again in a changed state, or
+until `clear_all()`.
 
 Upgrading or editing the library changes the source hash, so cache entries
 written by an older build are never reused. Clearing by hand is only needed

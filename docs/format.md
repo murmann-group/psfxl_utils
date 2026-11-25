@@ -94,11 +94,38 @@ Three files per analysis:
 Data is split into *flushes* (time segments). Each flush holds one frame per
 signal, in signal order, as a sequence of chunks.
 
-### Type-3 chunk (compressed)
+### Type-3 chunk (one block per signal)
 
-ASCII header of the form `\x003:seq:?:num_points:chunk_size\n` (fields in
-hex), followed by a blosc1 frame. `seq` 0 carries the time axis plus signal
-0 (two consecutive blosc blocks); `seq` ≥ 1 carries one signal each.
+ASCII header `\x003:seq:?:num_points:chunk_size:flag[:field...]\n` (numbers
+in hex), then an alignment pad of `8 - (offset % 8)` zero bytes -- always 1-8,
+never 0, emitted even when the offset is already 8-byte aligned -- then
+exactly `chunk_size` payload bytes. The next record starts right after the
+payload, so the decoder walks from chunk to chunk instead of searching: a
+`\x003:` byte run inside compressed or raw data is never taken for a header.
+
+A flush is a `seq` 0 chunk followed by `seq` 1 ... N-1, all with the same
+`num_points`. `seq` 0 carries the time axis and then signal 0, back to back
+with no pad between them; every other chunk carries one signal.
+
+The **flag** says how each block is stored, one hex digit per block:
+
+| Digit | Block |
+|-------|-------|
+| `2` | blosc1 frame |
+| `1` | raw LZ4 *block* (no frame header) of `num_points × 8` bytes |
+| `0` | uncompressed: `num_points` doubles, or a single double (8 bytes) when the signal is constant for the flush |
+| `a` | back-reference (`chunk_size` is 0; see below) |
+
+- **`seq` 0:** two digits, time then signal 0 (`22`, `20`, `02`, `11`, ...).
+  A missing flag means both blocks are uncompressed. The fields after the
+  flag list the size of each compressed block in order; signal 0's block is
+  whatever remains of `chunk_size` after the time block.
+- **`seq` ≥ 1:** the low digit applies (`a2`, `a0`, `aa`, `81`, ...); the
+  high digit (`a` or `8`) varies between files and does not affect decoding.
+
+Spectre stores short flushes -- typically the last one -- uncompressed or
+as LZ4, so a decoder that assumes every block is blosc loses or misplaces
+exactly the end of the waveform.
 
 Blosc1 frame header (little-endian):
 
@@ -112,27 +139,21 @@ bytes 8-11 blocksize    (u32 LE)
 bytes 12-15 cbytes      (compressed size incl. this 16-byte header, u32 LE)
 ```
 
-Because `versionlz` and `flags` legitimately vary between files, the decoder
-identifies the right block by matching `nbytes == num_points × 8` rather
-than a fixed magic pattern.
+The decoder checks `nbytes == num_points × 8` and that `cbytes` matches the
+block size the header implies before decompressing. Decompressed payload:
+`num_points` little-endian float64 values.
 
-Payload after decompression: `num_points` little-endian float64 values.
+### Back-referenced chunks
 
-### Constant and back-referenced chunks
-
-- `chunk_size == 0` — **not** a run of zeros. Spectre writes it when this
-  signal's data for this flush is byte-identical to a block already in the
-  file (two clock phases with the same duty, a bus whose bits carry the same
-  code) and points at that block with a trailing `<back_offset>.<length>`
-  field: the block starts `back_offset` bytes before this chunk header and
-  its compressed size is `length`. Filling zeros here would silently replace
-  a real waveform with a flat line.
-- `chunk_size == 8` — a constant (DC) value stored as one raw double,
-  preceded by a 1–8 byte null pad to the next 8-byte file offset. The pad is
-  always emitted, even when the position is already aligned, so the skip is
-  `8 - (offset % 8)` (never 0). Skipping *all* nulls instead would corrupt
-  signals whose constant value is 0.0 and could swallow the next chunk
-  header's leading null byte.
+`chunk_size == 0` is **not** a run of zeros. Spectre writes it when this
+signal's data for this flush is byte-identical to a block already in the
+file (two clock phases with the same duty, a bus whose bits carry the same
+code) and points at that block with a trailing `<back_offset>.<length>`
+field: the block starts `back_offset` bytes before this chunk header and
+its compressed size is `length`. Filling zeros here would silently replace a
+real waveform with a flat line. A constant signal is instead stored as an
+8-byte uncompressed block (flag digit `0`); its value can be `0.0`, which is
+why pads are always computed and never found by skipping null bytes.
 
 ### Type-1 chunk (uncompressed, no index table)
 
@@ -161,7 +182,7 @@ Two differences from type-2, both of which corrupt a decode if missed:
    signals, uncompressed float64.
 
 2. **No ASCII index table, but there IS an alignment pad.** It follows the
-   same rule as the constant-chunk pad above: `8 - (offset % 8)`, always 1–8
+   same rule as the type-3 pad above: `8 - (offset % 8)`, always 1–8
    bytes, never 0, emitted even when the offset is already 8-byte aligned.
 
    Do **not** locate the payload by scanning past null bytes the way the
@@ -174,7 +195,8 @@ Two differences from type-2, both of which corrupt a decode if missed:
    monotonicity check does not catch; `_find_type1_chunks()` tests for it
    explicitly.
 
-Identify a file's containers by their chunk markers:
+Identify a file's containers by their chunk markers (a rough count: the same
+byte patterns also occur by chance inside compressed data):
 
 ```bash
 python -c "
@@ -187,33 +209,42 @@ print(Counter(m.group(1).decode() for m in re.finditer(rb'\x00(\d):', data)))
 # {'1': 1}   -> 1 type-1 chunk, the whole flush
 ```
 
+A file can mix containers from one flush to the next: many runs store the
+first flush as type-1 and every later flush as type-3, or end with one or
+more type-2 flushes.
+
 ### Type-2 chunk (uncompressed)
 
 ASCII header `\x002:seq:?:num_traces:num_points:binary_size\n` (hex fields,
 with `binary_size == (num_traces + 1) × num_points × 8`), followed by an
-ASCII index table, null padding (variable length), then raw little-endian
-doubles grouped as `(num_traces + 1)` blocks of `num_points`: time first,
-then each signal.
+ASCII index table, an alignment pad of `8 - (offset % 8)` bytes after the
+table (1-8, never 0), then raw little-endian doubles grouped as
+`(num_traces + 1)` blocks of `num_points`: time first, then each signal.
 
-Two kinds of type-2 chunk exist, distinguished only by their content:
+### Flush order and checkpoints
 
-- **Final flush** — data past the end of the type-3 range; decoded normally.
-- **Intermediate checkpoint** — written periodically while the simulation
-  runs; its time range is later re-compressed into type-3 blocks, making the
-  checkpoint redundant. Identified by `first_time <= last type-3 time` and
-  skipped (with a warning). Interrupted simulations typically leave one of
-  these behind.
+In every file examined, flushes appear in the file in time order, each
+starting after the previous one ends, whatever their container. The decoder
+assembles them by start time (which is therefore file order), preferring a
+type-3 flush when two start together. As a safeguard, a flush whose time range
+is already covered by earlier data (such as a checkpoint record left by an
+interrupted simulation) is skipped, and one that overlaps is trimmed to its
+new samples, both with a `UserWarning`.
 
-### Unrecognised containers
+Each container's marker bytes can also occur by chance inside another
+container's data. A type-1/type-2 record header inside a type-3 payload, or a
+type-3 header inside a type-1/type-2 payload, is ignored.
 
-Every branch that drops a chunk does so by skipping it, so a file built from a
-container this decoder does not know would otherwise fall through to an empty
-result with no diagnostic — a well-formed `PSF` with correct signal names and
-every ordinate empty, which callers then compute on. `decode_psfxl()` therefore
-issues a `RuntimeWarning` when it finds no decodable type-1, type-2 or type-3
-block, so an unknown container is visible rather than silent.
+### Undecodable data
 
----
+A block that cannot be decoded -- an unknown flag, a size that does not add
+up, a failed decompression, a back-reference to nothing, a flush cut short
+by a truncated file -- becomes NaN for that signal and that flush, and one
+`RuntimeWarning` lists the affected chunks. Every signal therefore stays
+aligned with the time axis: a sample is never shifted, dropped or taken from
+another signal. If a flush's time block itself cannot be decoded, the whole
+flush is dropped (with a warning). A file with no decodable flush at all
+gives an empty result and a `RuntimeWarning`.
 
 ## Flat PSF (0x200)
 
@@ -224,13 +255,11 @@ followed by a VALUE section containing one record per entry per sweep point:
 TAG_ENTRY(4) entry_idx(4) value(8 real | 16 complex)
 ```
 
-Two layouts occur in practice:
-
-- **Dense** — records for all entries of a sweep point are contiguous, and
-  every sweep point has the same byte layout (fixed stride). Decoded with
-  NumPy stride tricks in one pass.
-- **Sparse** — padding between records; decoded by scanning for the
-  `\x00\x00\x00\x10` marker.
+Every sweep point has the same byte layout. Each record's size follows from
+its entry's type in the header (the TYPE entry's data-type code: `0x0b` real,
+`0x0c` complex; GROUP noise types as below). After the last point comes the
+`0x0f` end tag, so in a single-point file the last record is not followed by
+another record and its size cannot be inferred from the data.
 
 For noise GROUP types the record is extended:
 `TAG EID comp_0(8) comp_1(8) … total(8)` — the per-mechanism doubles come

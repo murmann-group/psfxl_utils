@@ -99,10 +99,11 @@ print(f"Time: {sweep.abscissa[0]:.3g} to {sweep.abscissa[-1]:.3g} {sweep.units}"
 print(f"Vout range: {vout.ordinate.min():.4f} to {vout.ordinate.max():.4f} {vout.units}")
 ```
 
-If the simulation was interrupted before completion, the decoder still
-reconstructs all data written so far and emits a `UserWarning` describing any
-redundant checkpoint chunks it skipped (see
-[internals — interrupted simulations](internals.md#interrupted-simulations)).
+If the result file is incomplete (a simulation still running, interrupted,
+or a truncated copy), the decoder returns every flush it can decode. Samples
+it cannot decode are NaN, with a `RuntimeWarning` naming the affected chunks,
+so every signal still lines up with the time axis (see
+[format: undecodable data](format.md#undecodable-data)).
 
 ---
 

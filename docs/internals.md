@@ -14,7 +14,7 @@ pipeline, and the caching layers. Byte-level file-format details live in
 | `psf_class.py` | The three public classes. `PSF` selects the correct decoder by magic bytes and manages caching. |
 | `psf_parse.py` | Shared binary parsing: tag/string/property readers, magic-number constants, and `parse_psf_header` for PSFXL and flat PSF headers. |
 | `psfxl_decoder.py` | PSFXL waveform decoder (`.tran.psfxl`), including blosc decompression and flush reassembly. |
-| `flat_psf_decoder.py` | Flat PSF decoder (`.ac`, `.noise`, `.dc`) with dense (stride-based) and sparse (marker-scanning) paths. |
+| `flat_psf_decoder.py` | Flat PSF decoder (`.ac`, `.noise`, `.dc`): record layout from the header types, with data-inferred and marker-scanning fallbacks. |
 | `oppoint_psf_decoder.py` | Info/op-point decoder for the `0x500` magic format (`dcOp.dc`, `dcOpInfo.info`, other `.info`). |
 | `psf_cache.py` | Disk cache: pickle read/write and invalidation. Called transparently by `PSF.__init__`. |
 
@@ -28,12 +28,12 @@ surface.
 
 `PSF(path)` runs the following sequence:
 
-1. **Memory cache probe** — if the path was loaded before in this process
-   and the file's SHA-256 hash is unchanged, reuse the decoded arrays.
-2. **Disk cache probe** — if the cache directory (`$PSFXL_UTILS_CACHE_DIR`,
-   default `~/.cache/psfxl_utils/`) holds a pickle whose
-   embedded mtime matches the source file, load it (and promote it to the
-   memory cache).
+1. **Take the cache keys** — stat the header file and its `.psfxl` data file
+   (see [Caching](#caching)). This happens before anything is decoded.
+2. **Memory cache probe** — if the path was loaded before in this process
+   and the fingerprint is unchanged, reuse the decoded arrays. Otherwise
+   probe the **disk cache** for an entry with this key, and promote a hit to
+   the memory cache.
 3. **Full decode** — read the first 4 bytes of the file and dispatch on the
    magic number:
 
@@ -51,52 +51,46 @@ surface.
 
 Transient data is split across three files: the `.tran` header (signal
 names, types, units), the `.tran.psfxl` data file, and the `.tran.sig`
-metadata file. The data file contains a sequence of *flushes* (time
-segments); each flush holds one compressed frame per signal:
+metadata file. The data file is a sequence of *flushes* (time segments),
+each stored in one of three containers:
 
-- **Type-3 chunks** — blosc-compressed (LZ4 + byte-shuffle) IEEE 754
-  doubles. The decoder pre-scans all chunk headers, then locates each
-  chunk's blosc block by fingerprinting the expected uncompressed size
-  (`num_points × 8`) rather than trusting fixed magic bytes, which vary
-  with compressor and shuffle settings.
-- **Constant chunks** — signals that are constant within a flush are stored
-  as either a zero-length chunk (value 0.0) or a single raw double.
-- **Type-2 chunks** — uncompressed flush records: an ASCII index table
-  followed by raw doubles grouped as `(num_traces + 1) × num_points`
-  (time first, then each signal). The final flush of a simulation is
-  usually written this way.
+- **Type-3** — one block per signal. The chunk header's flag says how each
+  block is stored: blosc, raw LZ4, uncompressed (an array, or one double for
+  a constant signal) or a back-reference to an identical block earlier in
+  the file. The decoder walks the headers chunk to chunk (the next header
+  starts where the declared payload ends) and decodes each block by its
+  flag; nothing is located by searching.
+- **Type-1 / type-2** — all signals of a flush in one uncompressed block,
+  grouped as `(num_traces + 1) × num_points` (time first).
 
-Arrays from all flushes are concatenated per signal at the end.
-
-### Interrupted simulations
-
-While running, Spectre periodically writes small uncompressed type-2
-*checkpoint* records. Once the same time range has been compressed into
-type-3 blocks, those checkpoints are redundant — decoding them would
-duplicate or back-track the time axis. This matters in particular for
-simulations that were interrupted before completing.
-
-The decoder classifies each type-2 chunk by its first time value: chunks at
-or before the last decoded type-3 time are skipped (with a `UserWarning`
-listing the skipped checkpoint times); only chunks strictly beyond it are
-treated as genuine end-of-simulation flushes. The classification is purely
-data-driven, so it is independent of how Spectre orders sections in the file.
+Flushes are assembled by start time, which is file order (see
+[format](format.md#flush-order-and-checkpoints)), and each signal is
+concatenated across them. A block that cannot be decoded is NaN for that
+flush, with a `RuntimeWarning`, so every returned signal has the same length
+as the time axis ([format](format.md#undecodable-data)).
 
 ### Flat PSF decoding
 
-The VALUE section of `.ac`/`.noise`/`.dc` files is decoded with two
-strategies:
+The VALUE section of `.ac`/`.noise`/`.dc` files is decoded from the
+header's types: each record's size follows from its trace (real 16 bytes,
+complex 24, a GROUP noise device `8 + 8 × n_inline`), the first sweep point
+gives the stride, every record of every point is checked for its tag and
+entry index, and all points are then extracted at once with NumPy stride
+tricks. Sizes are never inferred from where the next record starts, which
+fails for a single-point file (the last record is followed by the end tag,
+not another record).
 
-- **Dense path** — when records are contiguous, the layout of the first
-  sweep point gives a fixed stride, and all points are extracted at once
-  with NumPy stride tricks (no Python-level loop).
-- **Sparse path** — fallback when padding sits between records; scans for
-  `TAG_ENTRY` markers with `bytes.find` and assembles arrays point by point.
+If the header does not determine the layout (a trace's type is missing, or
+the data holds an entry the header does not list), the older paths are
+used: a dense path that infers record sizes from the data, then a sparse
+path that scans for `TAG_ENTRY` markers and reads only the first value of
+each record. The sparse path warns, since it loses imaginary parts and
+noise components.
 
 Noise files may store per-mechanism device contributions inline after each
 device's total value (GROUP types). The header parser synthesizes virtual
 sub-traces (`<device>.<mechanism>`) for these, and the decoder extracts them
-with the same stride approach.
+from the same layout.
 
 ### Info / op-point decoding
 
@@ -134,35 +128,49 @@ Two transparent layers, both managed by `PSF.__init__`:
 
 | Layer | Store | Invalidation |
 |-------|-------|--------------|
-| Memory (per process) | `PSF._instance_cache` dict | SHA-256 hash of the source file, recomputed on every hit |
-| Disk (across sessions) | `$PSFXL_UTILS_CACHE_DIR/*.pkl`, default `~/.cache/psfxl_utils/*.pkl` | nanosecond mtime **and** library source hash, both embedded in the cache filename |
+| Memory (per process) | `PSF._instance_cache` dict | source fingerprint |
+| Disk (across sessions) | `$PSFXL_UTILS_CACHE_DIR/*.pkl`, default `~/.cache/psfxl_utils/*.pkl` | source fingerprint **and** library source hash, both in the entry name |
 
-**Memory layer.** Keyed by resolved path. On every lookup the source file is
-re-hashed; a hash mismatch (file changed on disk) forces a reload. This makes
-repeated loads within one process cost only the hash pass (< 1 ms for typical
-files) instead of a full decode.
+**Source fingerprint.** `psf_cache.source_fingerprint()` hashes the header
+file's mtime (ns), size, inode and ctime, plus the mtime, size and inode of
+the `<header>.psfxl` data file when there is one. A PSFXL result is two files
+and either can change alone (a running simulation appends to the data file),
+so both are covered. ctime catches copies that preserve mtime and size
+(`cp -p`, `rsync -t`); metadata-only changes such as chmod or rename also
+change it, which costs one re-decode. On NFS a stat can be served from the
+client's attribute cache for a few seconds, so a file rewritten on another
+host can briefly look unchanged.
 
-**Disk layer.** Cache filenames have the form
-`<stem>_<path-md5-prefix>_<lib-hash>_<mtime_ns>.pkl`. The MD5-of-path prefix
-only disambiguates identically named files from different directories (it is
-not an integrity check); the nanosecond mtime makes any modification of the
-source file — including rewrites within the same second — miss the cache and
-trigger a re-decode.
+**Keys are taken before decoding.** `PSF.__init__` computes the fingerprint
+and the disk key once, before it decodes. After decoding, the result is
+saved to disk and registered in memory only if the source files still match
+those keys. Otherwise (a simulation still writing, a re-run that finished
+mid-decode) the result may not match the file now on disk, so it is not
+cached, and a `PSFCacheWarning` says so.
+
+**Disk layer.** Entry names have the form
+`<stem>_<path-md5-prefix>_<lib-hash>_<fingerprint>.pkl`, with the stem cut to
+64 characters (the path hash keeps names unique). The MD5-of-path prefix only
+disambiguates identically named files from different directories (it is not
+an integrity check).
 
 `<lib-hash>` is `psf_cache.LIB_HASH`, an MD5 prefix over the source of every
 `.py` in the package, computed once at import. It makes a library change
 invalidate the cache too. Without it, a decoder fix silently does nothing on
 any file already cached: `decode_psfxl()` returns the corrected waveform while
-`PSF()` keeps serving the pre-fix pickle for the same path and mtime, and the
-only way out is deleting the cache directory by hand. Hashing the source
-rather than a declared version number also covers uncommitted local edits.
+`PSF()` keeps serving the pre-fix pickle, and the only way out is deleting the
+cache directory by hand. Hashing the source rather than a declared version
+number also covers uncommitted local edits.
 
-When a new cache entry is written, entries for older mtimes *and* older
-library hashes of the same source file are deleted, so neither repeated
-simulation nor repeated upgrades let the directory grow without bound.
-`clear_all()` deletes only top-level files whose names match the entry format
-above, never the directory itself, subdirectories or other files (including
-unrelated `.pkl` files).
+When a new entry is written, other entries for the same source file (other
+fingerprints, other library hashes) are deleted, so one source file never
+holds more than one entry. **The cache as a whole is not size-limited:**
+entries for result files that are never loaded again (deleted runs, old
+corners) stay until removed. An entry is roughly the size of the decoded
+arrays, which can be larger than the `.psfxl` file. `clear_all()` deletes
+every entry, and only top-level files whose names match the entry format
+(current or older versions), never the directory itself, subdirectories or
+other files (including unrelated `.pkl` files).
 
 **Location.** `psf_cache.get_cache_dir()` returns `$PSFXL_UTILS_CACHE_DIR`
 when the variable is set and not blank, else `~/.cache/psfxl_utils`. `~` is
@@ -171,19 +179,40 @@ resolved against the current directory on every access, so it moves if the
 process changes directory; use an absolute path. The variable is read on every
 cache access, so changing it after import takes effect immediately. If the
 directory cannot be created, the disk layer is skipped and `PSF()` still
-decodes. A directory created for an override gets mode `0700`.
+decodes. A cache directory the library creates gets mode `0700`.
 
-Corrupted or unreadable cache files are treated as cache misses; cache write
-failures are silently ignored (the decode result is still returned).
+**Writes.** Entries are written to a `0600` temporary file
+(`.psfxl_tmp_*.tmp`) in the cache directory and renamed over the entry, so an
+entry is never half-written, its mode does not depend on the umask, and a
+symlink at the entry path is replaced rather than written through. Temporary
+files left by a killed writer are removed by the next save once they are an
+hour old, and by `clear_all()`. Write failures are non-fatal (the decode
+result is still returned) and are reported with a `PSFCacheWarning`.
 
 **Trust model.** Cache entries are pickles, and unpickling executes code.
-The cache lives in the per-user `~/.cache/psfxl_utils/` directory by default.
-If `PSFXL_UTILS_CACHE_DIR` redirects it, the target must likewise be writable
-only by you. This is enforced: if the override directory is not owned by you or
-is group/world-writable, the disk cache is disabled with a `RuntimeWarning`.
-(The default location is not checked, to keep its previous behaviour.)
+On POSIX systems:
 
-**Warnings and caching.** Warnings emitted during a decode (e.g. skipped
-checkpoint chunks of an interrupted simulation) are stored on the PSF object
-and re-emitted on every cache hit, so callers see them regardless of whether
-the data came from cache.
+- If `PSFXL_UTILS_CACHE_DIR` points at a directory that is not owned by you
+  or is group/world-writable, the disk cache is disabled with a
+  `PSFCacheWarning`. (The default `~/.cache/psfxl_utils` directory is not
+  checked, to keep its previous behaviour.)
+- In every directory, an entry is opened without following symlinks and
+  without blocking, and is unpickled only if the open descriptor is a
+  regular file owned by you and not group/world-writable. Anything else is a
+  miss, with a `PSFCacheWarning`, and is replaced on the next save.
+
+On Windows only the regular-file check applies; keep the cache directory
+private by other means.
+
+Corrupted or unreadable entries are treated as cache misses.
+
+**Cache warnings.** Every cache problem is reported as
+`psfxl_utils.PSFCacheWarning`, a `RuntimeWarning` subclass, pointing at the
+line that called `PSF()`. Each kind of problem is reported once per cache
+directory per process. The decoded result never depends on the cache, so
+strict test setups can turn warnings into errors and still exempt caching:
+`-W error -W ignore::psfxl_utils.PSFCacheWarning`.
+
+**Warnings and caching.** Warnings emitted during a decode (e.g. NaN-filled
+chunks) are stored on the PSF object and re-emitted on every cache hit, so
+callers see them regardless of whether the data came from cache.
