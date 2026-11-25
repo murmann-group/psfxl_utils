@@ -68,7 +68,6 @@ Example
     print(PSF.units_to_unicode("Ohm"))    # → Ω
 """
 
-import hashlib
 import struct
 import warnings
 from pathlib import Path
@@ -333,20 +332,9 @@ class PSF:
         '%': '%',
     }
 
-    # In-session instance cache: filepath -> {'obj': PSF, 'hash': str}
+    # In-session instance cache: filepath -> {'obj': PSF, 'fingerprint': str}
+    # (see psf_cache.source_fingerprint: covers the header and its .psfxl).
     _instance_cache = {}
-
-    @staticmethod
-    def _compute_file_hash(filepath, chunk_size=8192):
-        """Compute a SHA-256 hash of a file for cache-invalidation purposes."""
-        sha256 = hashlib.sha256()
-        with open(filepath, 'rb') as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
-                sha256.update(chunk)
-        return sha256.hexdigest()
 
     def __init__(self, path):
         """
@@ -368,13 +356,16 @@ class PSF:
         # constructor argument, never from a cached object.
         self.path = path
 
-        # Level 1: in-session memory cache (hash-validated to detect file changes).
+        # Both cache keys are taken BEFORE decoding: a key taken afterwards
+        # would file a result decoded from the old file under the new file's
+        # key if the file changed mid-decode (e.g. a re-run finishing).
+        fingerprint = psf_cache.source_fingerprint(path_str)
+
+        # Level 1: in-session memory cache.
         if path_str in PSF._instance_cache:
             cache_entry = PSF._instance_cache[path_str]
             cached = cache_entry['obj']
-            # Verify file hasn't changed since last load by comparing hash
-            current_hash = self._compute_file_hash(path)
-            if current_hash == cache_entry['hash']:
+            if fingerprint is not None and fingerprint == cache_entry['fingerprint']:
                 # Cache hit — copy instance data from the cached object.
                 self._sweep = cached._sweep
                 self._signals = cached._signals
@@ -382,20 +373,22 @@ class PSF:
                 for msg, cat in self._decode_warnings:
                     warnings.warn(msg, cat, stacklevel=2)
                 return
-            # Hash mismatch — file changed; fall through to reload.
+            # File changed; fall through to reload.
 
         # Level 2: on-disk pickle cache (populated by a prior Python session).
-        cached_psf = psf_cache.load_from_cache(path_str)
+        disk_key = psf_cache.get_cache_path(path_str)
+        cached_psf = (psf_cache.load_from_cache(path_str, cache_path=disk_key)
+                      if disk_key is not None else None)
         if cached_psf is not None:
             self._sweep = cached_psf._sweep
             self._signals = cached_psf._signals
             self._decode_warnings = getattr(cached_psf, '_decode_warnings', [])
             # Promote the disk-cache hit into the memory cache.
-            file_hash = self._compute_file_hash(path)
-            PSF._instance_cache[path_str] = {
-                'obj': self,
-                'hash': file_hash,
-            }
+            if fingerprint is not None:
+                PSF._instance_cache[path_str] = {
+                    'obj': self,
+                    'fingerprint': fingerprint,
+                }
             for msg, cat in self._decode_warnings:
                 warnings.warn(msg, cat, stacklevel=2)
             return
@@ -448,13 +441,15 @@ class PSF:
                 ordinate=ordinate,
              ))
         
-        # Persist to disk cache for future sessions, then register in memory cache.
-        psf_cache.save_to_cache(path_str, self)
-        file_hash = self._compute_file_hash(path)
-        PSF._instance_cache[path_str] = {
-            'obj': self,
-            'hash': file_hash,
-        }
+        # Persist to disk cache for future sessions, then register in memory
+        # cache -- each only if the file is unchanged since the keys were taken.
+        if disk_key is not None:
+            psf_cache.save_to_cache(path_str, self, cache_path=disk_key)
+        if fingerprint is not None and psf_cache.source_fingerprint(path_str) == fingerprint:
+            PSF._instance_cache[path_str] = {
+                'obj': self,
+                'fingerprint': fingerprint,
+            }
 
         # Re-emit captured warnings now that the object is fully built and cached.
         for msg, cat in self._decode_warnings:

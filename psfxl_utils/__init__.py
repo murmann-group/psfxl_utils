@@ -19,6 +19,7 @@ from .psf_class import PSF, Signal, Sweep
 from .psf_parse import parse_psf_header
 from .psfxl_decoder import decode_psfxl, parse_sig_file
 from .flat_psf_decoder import decode_psf_flat
+from .psf_cache import PSFCacheWarning
 
 __all__ = [
     'PSF',
@@ -28,4 +29,5 @@ __all__ = [
     'decode_psfxl',
     'decode_psf_flat',
     'parse_sig_file',
+    'PSFCacheWarning',
 ]
