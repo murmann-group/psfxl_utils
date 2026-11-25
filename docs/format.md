@@ -283,6 +283,7 @@ TYPE-section entries carry an extra `base_type` word after `type_ref`:
 | `0x05` | INT32 (long) | 4-byte BE signed int |
 | `0x01` | INT8 (byte) | stored as 4-byte BE signed int |
 | `0x0c` | COMPLEX | 2 × 8-byte BE doubles |
+| `0x0e` | STRING | 4-byte length, ASCII, padded to 4 bytes (e.g. `stb_state` in `.margin.stb`) |
 | `0x10` | STRUCT | no data; declares a struct type |
 
 Struct fields are declared as ENTRY records immediately following their
@@ -292,7 +293,10 @@ property is what distinguishes the two cases.
 
 VALUE-section entries mirror the TYPE section:
 
-- **Scalar** — `TAG EID name type_ref value [props]`.
+- **Scalar** — `TAG EID name type_ref value [props]`. A STRING value is not
+  a signal: the decoder returns string values, and string properties such as
+  `gainMarginInfo` or `model`, separately (`PSF.strings`), keyed by entry
+  name or `<entry>.<property>`.
 - **Struct** — `TAG EID name type_ref` then the packed field values in
   declaration order (8 or 4 bytes each per the field's base type), then
   optional trailing properties (e.g. `model`).

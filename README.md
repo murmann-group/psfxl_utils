@@ -105,6 +105,10 @@ dev = PSF('results/psf/dcOpInfo.info')
 vgs = dev.get_signal('M0.vgs').ordinate[0]
 print(f"Vgs = {vgs:.4f} V")
 
+# Text values are kept apart from the numeric signals
+stb = PSF('results/psf/stb.margin.stb')
+print(stb.get_signal('phaseMargin').ordinate[0], stb.get_string('stb_state'))
+
 for signal in psf.all_signals():
     print(f'{signal.name:<20} {signal.ordinate[0]:<12.6g} '
           f'{signal.units:<8} {signal.type.kind}')

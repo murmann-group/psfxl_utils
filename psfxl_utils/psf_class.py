@@ -396,6 +396,7 @@ class PSF:
                 # Cache hit — copy instance data from the cached object.
                 self._sweep = cached._sweep
                 self._signals = cached._signals
+                self._strings = dict(getattr(cached, '_strings', {}))
                 self._decode_warnings = getattr(cached, '_decode_warnings', [])
                 for msg, cat in self._decode_warnings:
                     warnings.warn(msg, cat, stacklevel=2)
@@ -409,6 +410,7 @@ class PSF:
         if cached_psf is not None:
             self._sweep = cached_psf._sweep
             self._signals = cached_psf._signals
+            self._strings = dict(getattr(cached_psf, '_strings', {}))
             self._decode_warnings = getattr(cached_psf, '_decode_warnings', [])
             # Promote the disk-cache hit into the memory cache.
             if fingerprint is not None:
@@ -427,12 +429,13 @@ class PSF:
         with open(path, 'rb') as _fh:
             _magic = struct.unpack('>I', _fh.read(4))[0]
 
+        self._strings = {}
         with warnings.catch_warnings(record=True) as _wlist:
             warnings.simplefilter('always')
 
             if _magic == PSF_MAGIC_INFO:
                 # PSF info/snapshot format — DC op-point or plain DC results.
-                time_arr, signals, traces = decode_psf_info(path)
+                time_arr, signals, traces = decode_psf_info(path, strings=self._strings)
                 sweep_name   = ''
                 sweep_units = ''
             else:
@@ -550,6 +553,33 @@ class PSF:
                 print(f"{signal.name:<20} {signal.ordinate[0]:.6g} {signal.units}")
         """
         return iter(self._signals)
+
+    @property
+    def strings(self):
+        """Text values stored alongside the signals, as a ``{name: str}`` dict.
+
+        Operating-point and stability files can hold strings that are not
+        signals: ``stb_state`` in a ``.margin.stb`` (the stability verdict,
+        the only explanation when every margin is NaN), and string
+        properties of entries, keyed ``<entry>.<property>`` (for example
+        ``gainMargin.gainMarginInfo`` or ``M0.model``).  Empty for other
+        files.  A copy is returned.
+        """
+        return dict(self._strings)
+
+    def get_string(self, name):
+        """Return the text value *name* (see :attr:`strings`).
+
+        Raises
+        ------
+        KeyError
+            If the file holds no string with that name.
+        """
+        try:
+            return self._strings[name]
+        except KeyError:
+            raise KeyError(f"no string {name!r} in {self.path.name}; "
+                           f"available: {sorted(self._strings)[:10]}") from None
 
     def get_signal(self, name):
         """

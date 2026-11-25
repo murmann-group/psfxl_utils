@@ -44,6 +44,7 @@ _INFO_INT    = 0x05   # 4-byte big-endian signed int  (INT LONG)
 _INFO_INT8   = 0x01   # 4-byte big-endian signed int  (INT BYTE; same storage as INT LONG)
 _INFO_CPLX   = 0x0c   # 16-byte complex (re, im)
 _INFO_STRUCT = 0x10   # struct container; size = sum of its fields
+_INFO_STRING = 0x0e   # length-prefixed, 4-byte-padded ASCII (e.g. stb_state)
 
 # Property / tag constants (same across all PSF formats)
 _TAG_ENTRY     = 0x10
@@ -159,7 +160,7 @@ def _parse_type_section(data, sec_start, sec_end):
                 struct_types[eid] = {'name': name, 'fields': []}
                 current_struct_eid = eid
 
-            elif base_type in (_INFO_FLOAT, _INFO_INT, _INFO_INT8, _INFO_CPLX):
+            elif base_type in (_INFO_FLOAT, _INFO_INT, _INFO_INT8, _INFO_CPLX, _INFO_STRING):
                 # Decide: struct field vs. standalone scalar signal type.
                 # Scalar type entries (dc.dc "V", "I", …) carry a "key" property.
                 if props.get('key') is not None:
@@ -191,12 +192,23 @@ def _parse_type_section(data, sec_start, sec_end):
 # VALUE section parser
 # ---------------------------------------------------------------------------
 
-def _parse_value_section(data, sec_start, sec_end, struct_types, scalar_types):
+def _parse_value_section(data, sec_start, sec_end, struct_types, scalar_types,
+                         strings=None):
     """Parse the VALUE section of a PSF 0x500 file.
 
     Returns a list of (signal_name, units, value) tuples where value is a
-    float, int cast to float, or complex number.
+    float, int cast to float, or complex number.  String values (base type
+    0x0e, e.g. ``stb_state``) and string properties of entries (e.g.
+    ``gainMargin.gainMarginInfo``) go into *strings* if a dict is given.
     """
+    if strings is None:
+        strings = {}
+
+    def keep_string_props(entry, props):
+        for k, v in props.items():
+            if isinstance(v, str):
+                strings[f"{entry}.{k}"] = v
+
     pos = sec_start + 8   # skip section container header
 
     tag = struct.unpack('>I', data[pos:pos + 4])[0]
@@ -239,7 +251,11 @@ def _parse_value_section(data, sec_start, sec_end, struct_types, scalar_types):
                         im, epos = _f64(data, epos)
                         signals.append((f"{name}.{field['name']}", field['units'],
                                         complex(re, im)))
+                    elif ft == _INFO_STRING:
+                        v, epos = _read_str(data, epos)
+                        strings[f"{name}.{field['name']}"] = v
                 _props, epos = _read_props(data, epos, scan_end)
+                keep_string_props(name, _props)
 
             elif type_ref in scalar_types:
                 # ---- Scalar-typed entry (node voltage, branch current, etc.) -
@@ -255,7 +271,11 @@ def _parse_value_section(data, sec_start, sec_end, struct_types, scalar_types):
                     re, epos = _f64(data, epos)
                     im, epos = _f64(data, epos)
                     signals.append((name, stype['units'], complex(re, im)))
+                elif bt == _INFO_STRING:
+                    v, epos = _read_str(data, epos)
+                    strings[name] = v
                 _props, epos = _read_props(data, epos, scan_end)
+                keep_string_props(name, _props)
 
             else:
                 # Unknown type reference — skip gracefully
@@ -274,7 +294,7 @@ def _parse_value_section(data, sec_start, sec_end, struct_types, scalar_types):
 # Public API
 # ---------------------------------------------------------------------------
 
-def decode_psf_info(path):
+def decode_psf_info(path, strings=None):
     """Decode a PSF 'info' format file (magic 0x00000500).
 
     Works for both:
@@ -285,6 +305,12 @@ def decode_psf_info(path):
         sweep_arr (np.ndarray): length-1 array ``[0.0]`` — snapshot, no sweep axis.
         signals   (dict):       sequential_index -> np.ndarray([value])
         traces    (list):       list of dicts with 'name', 'units', 'entry_idx'
+
+    If *strings* is a dict, string-valued entries (e.g. ``stb_state`` in a
+    stability ``.margin.stb``) and string properties of entries (keyed
+    ``<entry>.<property>``, e.g. ``gainMargin.gainMarginInfo`` or
+    ``M0.model``) are stored in it.  They are not signals: a signal's
+    ordinate is always numeric.
     """
     path = str(path)
 
@@ -312,7 +338,8 @@ def decode_psf_info(path):
                 data, type_sec_start, type_sec_end)
 
             raw_signals = _parse_value_section(
-                data, val_sec_start, val_sec_end, struct_types, scalar_types)
+                data, val_sec_start, val_sec_end, struct_types, scalar_types,
+                strings)
 
     sweep_arr = np.array([0.0])
     signals: dict = {}
