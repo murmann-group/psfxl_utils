@@ -1,0 +1,77 @@
+"""Flat PSF VALUE-section decoding from the header-derived record layout.
+
+The VALUE section holds, per sweep point, one record per entry:
+TAG_ENTRY(0x10, 4) + entry index (4) + payload, big-endian.  Payload is one
+double (real), two (complex: real, imag) or, for a GROUP noise device, its
+component doubles followed by its total.  A single-point file is followed
+by the 0x0f end tag instead of a second point, so record sizes cannot be
+inferred from where the next record starts; they come from the header.
+"""
+
+import struct
+
+import numpy as np
+import pytest
+
+from psfxl_utils.flat_psf_decoder import _decode_by_header_layout
+
+SWEEP = 1
+TRACES = [
+    {'name': 'v_out', 'entry_idx': 10, 'complex': True, 'type_known': True,
+     'n_inline': 1, 'inline_total_index': 0},
+    {'name': 'M0', 'entry_idx': 11, 'complex': False, 'type_known': True,
+     'n_inline': 3, 'inline_total_index': 2},
+    {'name': 'M0.rd', 'entry_idx': 11, 'complex': False, 'inline_index': 0},
+    {'name': 'M0.id', 'entry_idx': 11, 'complex': False, 'inline_index': 1},
+    {'name': 'R1', 'entry_idx': 12, 'complex': False, 'type_known': True,
+     'n_inline': 1, 'inline_total_index': 0},
+]
+
+
+def value_section(points):
+    """points: list of (freq, v_out complex, (rd, id, total), r1)."""
+    buf = b''
+    for f, v, (rd, idn, tot), r1 in points:
+        buf += struct.pack('>IId', 0x10, SWEEP, f)
+        buf += struct.pack('>IIdd', 0x10, 10, v.real, v.imag)
+        buf += struct.pack('>IIddd', 0x10, 11, rd, idn, tot)
+        buf += struct.pack('>IId', 0x10, 12, r1)
+    return buf + struct.pack('>I', 0x0f)
+
+
+POINTS = [(1e3, 1 - 2j, (1e-18, 3e-18, 4e-18), 5e-19),
+          (1e4, 0.5 + 0.25j, (2e-18, 1e-18, 3e-18), 6e-19),
+          (1e5, -1e-6 - 2e-12j, (0.0, 7e-18, 7e-18), 0.0)]
+
+
+@pytest.mark.parametrize('n', [1, 2, 3])
+def test_header_layout_decodes_any_point_count(n):
+    data = value_section(POINTS[:n])
+    sweep, sig = _decode_by_header_layout(data, 0, len(data), SWEEP, TRACES)
+    np.testing.assert_array_equal(sweep, [p[0] for p in POINTS[:n]])
+    np.testing.assert_array_equal(sig[0], [p[1] for p in POINTS[:n]])
+    assert np.iscomplexobj(sig[0])
+    np.testing.assert_array_equal(sig[1], [p[2][2] for p in POINTS[:n]])  # total
+    np.testing.assert_array_equal(sig[2], [p[2][0] for p in POINTS[:n]])  # rd
+    np.testing.assert_array_equal(sig[3], [p[2][1] for p in POINTS[:n]])  # id
+    np.testing.assert_array_equal(sig[4], [p[3] for p in POINTS[:n]])
+
+
+def test_unknown_type_falls_back():
+    traces = [dict(t) for t in TRACES]
+    traces[0]['type_known'] = False
+    data = value_section(POINTS[:1])
+    assert _decode_by_header_layout(data, 0, len(data), SWEEP, traces) is None
+
+
+def test_record_not_in_header_falls_back():
+    data = value_section(POINTS[:2]).replace(struct.pack('>II', 0x10, 12),
+                                             struct.pack('>II', 0x10, 99))
+    assert _decode_by_header_layout(data, 0, len(data), SWEEP, TRACES) is None
+
+
+def test_inconsistent_later_point_falls_back():
+    data = bytearray(value_section(POINTS))
+    stride = (len(data) - 4) // 3
+    struct.pack_into('>I', data, 2 * stride + 4, 12)   # corrupt point 3's sweep EID
+    assert _decode_by_header_layout(bytes(data), 0, len(data), SWEEP, TRACES) is None

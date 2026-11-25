@@ -211,6 +211,9 @@ def parse_psf_header(header_path):
                             'entry_idx': entry_idx,
                             'units': total_units,
                             'complex': is_complex,
+                            # False if the TYPE entry was not found and
+                            # 'complex' is only a default.
+                            'type_known': type_ref in type_codes,
                             # n_inline counts all trailing doubles (comps + total).
                             # The main trace reads the LAST one (total).
                             'n_inline': n_total_doubles,

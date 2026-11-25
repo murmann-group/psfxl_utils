@@ -1,6 +1,8 @@
 """Flat PSF decoder for .ac, .noise, .dc files."""
 
 import struct
+import warnings
+
 import numpy as np
 import mmap
 
@@ -53,12 +55,24 @@ def decode_psf_flat(header_path, header):
                 if eidx is not None and 'inline_index' not in t:
                     trace_map[eidx] = (i, t.get('complex', False))
 
-            # Try dense (stride-based) format first
+            # Preferred: record sizes from the header's types.  Works for any
+            # number of sweep points, including one.
+            result = _decode_by_header_layout(data, value_start, value_end,
+                                              sweep_eidx, traces)
+            if result is not None:
+                return result
+
+            # Fallbacks for layouts the header does not fully describe.
             result = _try_dense_format(data, value_start, value_end, sweep_eidx, trace_map)
             if result is not None:
                 sweep_arr, signal_arrays = result
             else:
-                # Fall back to sparse (marker-scanning) format
+                warnings.warn(
+                    f"{header_path}: VALUE section layout not recognised; decoded "
+                    f"by scanning for record markers, which reads only the first "
+                    f"(real) value of each record. Check complex and per-"
+                    f"component noise signals before using them.",
+                    RuntimeWarning, stacklevel=3)
                 sweep_arr, signal_arrays = _try_sparse_format(
                     data, value_start, value_end, sweep_eidx, trace_map
                 )
@@ -73,6 +87,103 @@ def decode_psf_flat(header_path, header):
                 )
 
             return sweep_arr, signal_arrays
+
+
+def _record_size(trace):
+    """Bytes of one VALUE record for *trace*: TAG(4) + EID(4) + payload.
+
+    A GROUP noise device (``n_inline > 1``) stores its components and then
+    its total as ``n_inline`` doubles; otherwise the payload is one complex
+    (16 bytes) or real (8 bytes) value.  Note ``n_inline`` is 1 for every
+    plain trace, so it must not be used as the double count on its own.
+    """
+    n_inline = trace.get('n_inline', 1)
+    if n_inline > 1:
+        return 8 + 8 * n_inline
+    return 24 if trace.get('complex') else 16
+
+
+def _decode_by_header_layout(data, value_start, value_end, sweep_eidx, traces):
+    """Decode the VALUE section using record sizes derived from the header.
+
+    The first sweep point is walked record by record, sizing each from its
+    trace's type; the sum is the stride.  Every record of every point is
+    then checked for the expected TAG_ENTRY and entry index before anything
+    is extracted.  Returns ``(sweep_arr, signal_arrays)``, or ``None`` if the
+    header does not determine the layout (a trace type missing, an entry in
+    the data that the header does not list, or a record that does not match).
+    """
+    if sweep_eidx is None:
+        return None
+    sizes = {sweep_eidx: 16}
+    mains = {}                     # entry_idx -> (seq_idx, trace)
+    for seq_idx, t in enumerate(traces):
+        if 'inline_index' in t:
+            continue
+        eid = t.get('entry_idx')
+        if eid is None or not t.get('type_known', True):
+            return None
+        sizes[eid] = _record_size(t)
+        mains[eid] = (seq_idx, t)
+
+    # Walk the first sweep point.
+    layout = {}                    # entry_idx -> offset of its record in a point
+    order = []
+    p = value_start
+    while p + 8 <= value_end:
+        tag, eid = struct.unpack_from('>II', data, p)
+        if tag != 0x10:
+            break                  # 0x0f end tag (single point) or section end
+        if order and eid == order[0]:
+            break                  # start of the second sweep point
+        if eid not in sizes or eid in layout:
+            return None
+        layout[eid] = p - value_start
+        order.append(eid)
+        p += sizes[eid]
+    stride = p - value_start
+    if stride == 0 or sweep_eidx not in layout:
+        return None
+    n_points = (value_end - value_start) // stride
+    if n_points == 0:
+        return None
+
+    raw = np.frombuffer(data[value_start:value_start + n_points * stride],
+                        dtype=np.uint8)
+    # Every record of every point must carry TAG_ENTRY and its entry index.
+    for eid, off in layout.items():
+        hdr = np.ndarray((n_points, 2), dtype='>u4', buffer=raw, offset=off,
+                         strides=(stride, 4))
+        if not ((hdr[:, 0] == 0x10).all() and (hdr[:, 1] == eid).all()):
+            return None
+    # Anything after the last point must be shorter than a point and must not
+    # be another record (a trailing end tag is expected).
+    tail = value_start + n_points * stride
+    if tail + 8 <= value_end and struct.unpack_from('>I', data, tail)[0] == 0x10:
+        return None
+
+    def column(off):
+        return np.ndarray(n_points, dtype='>f8', buffer=raw, offset=off,
+                          strides=(stride,)).astype(np.float64)
+
+    sweep_arr = column(layout[sweep_eidx] + 8)
+    signal_arrays = {}
+    for eid, (seq_idx, t) in mains.items():
+        if eid not in layout:
+            continue               # listed in the header but not stored
+        base = layout[eid] + 8
+        n_inline = t.get('n_inline', 1)
+        if n_inline > 1:
+            signal_arrays[seq_idx] = column(base + 8 * t['inline_total_index'])
+        elif t.get('complex'):
+            signal_arrays[seq_idx] = column(base) + 1j * column(base + 8)
+        else:
+            signal_arrays[seq_idx] = column(base)
+    for seq_idx, t in enumerate(traces):
+        if 'inline_index' in t and t.get('entry_idx') in layout:
+            signal_arrays[seq_idx] = column(layout[t['entry_idx']] + 8
+                                            + 8 * t['inline_index'])
+    return sweep_arr, signal_arrays
 
 
 def _try_dense_format(data, value_start, value_end, sweep_eidx, trace_map):
