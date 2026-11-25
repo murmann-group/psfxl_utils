@@ -8,7 +8,9 @@ decoded, and the test fails on the first file that breaks an invariant:
 * a PSFXL time axis is strictly increasing, has no NaN in any signal, and
   matches the sweep count in the ``.sig`` file when there is one;
 * decoding emits no RuntimeWarning (each one marks data the decoder could
-  not read).
+  not read);
+* a flat file has as many points as its header's ``PSF sweep points``;
+* an operating-point (0x500) file decodes to at least one signal.
 
 Optional limits: ``PSFXL_TEST_CORPUS_MAX_MB`` (default 300) skips larger
 data files.
@@ -22,6 +24,7 @@ import numpy as np
 import pytest
 
 from psfxl_utils.flat_psf_decoder import decode_psf_flat
+from psfxl_utils.oppoint_psf_decoder import decode_psf_info
 from psfxl_utils.psf_parse import parse_psf_header
 from psfxl_utils.psfxl_decoder import decode_psfxl, parse_sig_file
 
@@ -41,13 +44,24 @@ def _results():
                 continue
             try:
                 with open(p, 'rb') as f:
-                    if f.read(4) == b'\x00\x00\x02\x00':
-                        yield 'flat', p
+                    magic = f.read(4)
             except OSError:
-                pass
+                continue
+            if magic == b'\x00\x00\x02\x00':
+                yield 'flat', p
+            elif magic == b'\x00\x00\x05\x00':
+                yield 'info', p
 
 
 def _check(kind, path):
+    if kind == 'info':
+        with warnings.catch_warnings(record=True) as wl:
+            warnings.simplefilter('always')
+            _t, sig, _traces = decode_psf_info(path)
+        problems = [str(w.message) for w in wl if issubclass(w.category, RuntimeWarning)]
+        if not sig:
+            problems.append("operating-point file decoded to no signals")
+        return problems
     with warnings.catch_warnings(record=True) as wl:
         warnings.simplefilter('always')
         header = parse_psf_header(path)
@@ -60,6 +74,10 @@ def _check(kind, path):
     bad = {i: len(a) for i, a in sig.items() if len(a) != len(t)}
     if bad:
         problems.append(f"signal lengths {bad} != sweep length {len(t)}")
+    if kind == 'flat':
+        expected = header['header_props'].get('PSF sweep points', 0)
+        if isinstance(expected, int) and expected > 0 and expected != len(t):
+            problems.append(f"header says {expected} sweep points, decoded {len(t)}")
     if kind == 'psfxl':
         if len(t) > 1 and not np.all(np.diff(t) > 0):
             problems.append("time axis not strictly increasing")

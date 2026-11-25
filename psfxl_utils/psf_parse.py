@@ -1,5 +1,6 @@
 """Shared utilities for PSF file parsing (both PSFXL and flat formats)."""
 
+import os
 import struct
 import mmap
 
@@ -68,6 +69,43 @@ def _read_properties(data, pos, end):
     return props, pos
 
 
+def section_chain(data, header_end):
+    """Walk the sections that follow the header: ``sec_type(4) sec_end(4) ...``.
+
+    Returns ``(sections, truncated)`` where *sections* is a list of
+    ``(start, end)`` and *truncated* is True when the last section's declared
+    end lies past the end of the file; that section is then included with
+    its end clipped to the file size.  A file whose sections are all intact
+    but whose trailer (offset table + ``Clarissa`` marker) is cut is not
+    truncated: its data is complete.
+    """
+    file_end = len(data)
+    sections = []
+    pos = header_end
+    while pos + 8 <= file_end:
+        sec_end = struct.unpack('>I', data[pos + 4:pos + 8])[0]
+        if sec_end <= pos:
+            break
+        if sec_end > file_end:
+            sections.append((pos, file_end))
+            return sections, True
+        sections.append((pos, sec_end))
+        pos = sec_end
+    return sections, False
+
+
+def check_file_header(data, path):
+    """Raise ValueError unless *data* holds a complete 12-byte PSF file header."""
+    if len(data) < 12:
+        raise ValueError(f"{path}: truncated or corrupt PSF file "
+                         f"({len(data)} bytes, shorter than the file header)")
+    header_end = struct.unpack('>I', data[8:12])[0]
+    if not 12 <= header_end <= len(data):
+        raise ValueError(f"{path}: truncated or corrupt PSF file (header ends at "
+                         f"{header_end}, file is {len(data)} bytes)")
+    return header_end
+
+
 def parse_psf_header(header_path):
     """Parse the binary PSF header file to extract signal metadata.
 
@@ -85,8 +123,15 @@ def parse_psf_header(header_path):
             'sweep': dict with 'name', 'units', 'entry_idx'
             'traces': ordered list of trace signal dicts
             'format': 'psfxl' or 'flat'
+            'value_section': (start, end) of a flat file's VALUE section
+            'truncated': True if that section runs past the end of the file
+
+    Raises ValueError for a file too short or too damaged to parse.
     """
     with open(header_path, 'rb') as f:
+        if os.fstat(f.fileno()).st_size < 12:
+            raise ValueError(f"{header_path}: truncated or corrupt PSF file "
+                             f"(shorter than the file header)")
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
 
             pos = 0
@@ -102,6 +147,7 @@ def parse_psf_header(header_path):
 
             _, pos = _read_u32(data, pos)  # count
             header_end, pos = _read_u32(data, pos)
+            check_file_header(data, header_path)
 
             # --- HEADER section: properties from offset 12 to header_end ---
             header_props, _ = _read_properties(data, pos, header_end)
@@ -135,17 +181,17 @@ def parse_psf_header(header_path):
             # Sections are: sec_type(4) + sec_end(4), last one is VALUE.
             file_end = len(data)
             metadata_end = file_end  # default: scan everything (PSFXL headers)
+            value_section, truncated = None, False
             if is_flat:
-                scan_pos = header_end
-                prev_sec_start = header_end
-                while scan_pos < file_end - 8:
-                    sec_end = struct.unpack('>I', data[scan_pos + 4:scan_pos + 8])[0]
-                    if sec_end <= scan_pos or sec_end > file_end:
-                        break
-                    prev_sec_start = scan_pos
-                    scan_pos = sec_end
-                # prev_sec_start is the start of the last (VALUE) section
-                metadata_end = prev_sec_start
+                # The last section is VALUE.  In a truncated file the section
+                # that runs past EOF is taken as VALUE, which is checked below:
+                # the complete sections before it must have yielded traces.
+                sections, truncated = section_chain(data, header_end)
+                if sections:
+                    value_section = sections[-1]
+                    metadata_end = value_section[0]
+                else:
+                    metadata_end = header_end
 
             pos = header_end
             entry_tag_bytes = struct.pack('>I', TAG_ENTRY)
@@ -283,7 +329,15 @@ def parse_psf_header(header_path):
             if _grp_eid >= 0 and _grp_comps:
                 group_type_components[_grp_eid] = list(_grp_comps)
 
+            if is_flat and truncated and not traces:
+                raise ValueError(
+                    f"{header_path}: truncated PSF file: it ends inside its "
+                    f"metadata sections ({file_end} bytes), so no signals can "
+                    f"be named")
+
             return {
+                'value_section': value_section,
+                'truncated': truncated,
                 'header_props': header_props,
                 'sweep': {'name': sweep_name, 'units': sweep_units,
                           'entry_idx': sweep_entry_idx},

@@ -6,6 +6,8 @@ import warnings
 import numpy as np
 import mmap
 
+from .psf_parse import check_file_header, section_chain
+
 
 def decode_psf_flat(header_path, header):
     """Decode sweep and trace data from a flat PSF file (.ac, .noise, .dc).
@@ -26,22 +28,15 @@ def decode_psf_flat(header_path, header):
     """
     with open(header_path, 'rb') as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            file_size = len(data)
-            header_end = struct.unpack('>I', data[8:12])[0]
-
-            # Walk sections to find the VALUE section (always last)
-            pos = header_end
-            value_start = value_end = None
-            while pos < file_size - 8:
-                sec_end = struct.unpack('>I', data[pos + 4:pos + 8])[0]
-                if sec_end <= pos or sec_end > file_size:
-                    break
-                value_start = pos + 8
-                value_end = sec_end
-                pos = sec_end
-
-            if value_start is None or value_end is None:
+            if 'value_section' in header:
+                section, truncated = header['value_section'], header['truncated']
+            else:  # a header dict from an older parse_psf_header
+                header_end = check_file_header(data, header_path)
+                sections, truncated = section_chain(data, header_end)
+                section = sections[-1] if sections else None
+            if section is None:
                 return np.array([]), {}
+            value_start, value_end = section[0] + 8, section[1]
 
             traces = header['traces']
             sweep_eidx = header['sweep'].get('entry_idx')
@@ -58,9 +53,24 @@ def decode_psf_flat(header_path, header):
             # Preferred: record sizes from the header's types.  Works for any
             # number of sweep points, including one.
             result = _decode_by_header_layout(data, value_start, value_end,
-                                              sweep_eidx, traces)
+                                              sweep_eidx, traces,
+                                              truncated=truncated)
             if result is not None:
+                if truncated:
+                    expected = header.get('header_props', {}).get('PSF sweep points', 0)
+                    of = f" of {expected}" if isinstance(expected, int) and expected > 0 else ''
+                    warnings.warn(
+                        f"{header_path}: file is truncated; decoded the "
+                        f"{len(result[0])}{of} sweep points it holds in full",
+                        RuntimeWarning, stacklevel=3)
                 return result
+            if truncated:
+                # The fallbacks infer the layout from the data and would read
+                # a partial last point as real values.
+                raise ValueError(
+                    f"{header_path}: truncated PSF file: it ends inside its first "
+                    f"sweep point, or its layout cannot be determined from the "
+                    f"header, so no complete values can be decoded")
 
             # Fallbacks for layouts the header does not fully describe.
             result = _try_dense_format(data, value_start, value_end, sweep_eidx, trace_map)
@@ -103,7 +113,8 @@ def _record_size(trace):
     return 24 if trace.get('complex') else 16
 
 
-def _decode_by_header_layout(data, value_start, value_end, sweep_eidx, traces):
+def _decode_by_header_layout(data, value_start, value_end, sweep_eidx, traces,
+                             truncated=False):
     """Decode the VALUE section using record sizes derived from the header.
 
     The first sweep point is walked record by record, sizing each from its
@@ -112,6 +123,10 @@ def _decode_by_header_layout(data, value_start, value_end, sweep_eidx, traces):
     is extracted.  Returns ``(sweep_arr, signal_arrays)``, or ``None`` if the
     header does not determine the layout (a trace type missing, an entry in
     the data that the header does not list, or a record that does not match).
+
+    With *truncated*, the VALUE section was cut short: only complete sweep
+    points are returned, and ``None`` unless the first point is complete
+    (the walk must reach the start of the second point).
     """
     if sweep_eidx is None:
         return None
@@ -130,11 +145,13 @@ def _decode_by_header_layout(data, value_start, value_end, sweep_eidx, traces):
     layout = {}                    # entry_idx -> offset of its record in a point
     order = []
     p = value_start
+    second_point = False
     while p + 8 <= value_end:
         tag, eid = struct.unpack_from('>II', data, p)
         if tag != 0x10:
             break                  # 0x0f end tag (single point) or section end
         if order and eid == order[0]:
+            second_point = True
             break                  # start of the second sweep point
         if eid not in sizes or eid in layout:
             return None
@@ -143,6 +160,8 @@ def _decode_by_header_layout(data, value_start, value_end, sweep_eidx, traces):
         p += sizes[eid]
     stride = p - value_start
     if stride == 0 or sweep_eidx not in layout:
+        return None
+    if truncated and not second_point:
         return None
     n_points = (value_end - value_start) // stride
     if n_points == 0:
@@ -159,7 +178,8 @@ def _decode_by_header_layout(data, value_start, value_end, sweep_eidx, traces):
     # Anything after the last point must be shorter than a point and must not
     # be another record (a trailing end tag is expected).
     tail = value_start + n_points * stride
-    if tail + 8 <= value_end and struct.unpack_from('>I', data, tail)[0] == 0x10:
+    if (not truncated and tail + 8 <= value_end
+            and struct.unpack_from('>I', data, tail)[0] == 0x10):
         return None
 
     def column(off):

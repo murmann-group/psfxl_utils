@@ -30,10 +30,13 @@ VALUE entries mirror what is in TYPE:
     properties follow (e.g. PROP("model" "…")).
 """
 
+import os
 import struct
 import mmap
 
 import numpy as np
+
+from .psf_parse import check_file_header, section_chain
 
 # Base-type codes found in the 0x500 TYPE section
 _INFO_FLOAT  = 0x0b   # 8-byte big-endian double
@@ -286,20 +289,18 @@ def decode_psf_info(path):
     path = str(path)
 
     with open(path, 'rb') as fh:
+        if os.fstat(fh.fileno()).st_size < 12:
+            raise ValueError(f"{path}: truncated or corrupt PSF file "
+                             f"(shorter than the file header)")
         with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            _magic, _  = _u32(data, 0)
-            _count, _  = _u32(data, 4)
-            header_end = struct.unpack('>I', data[8:12])[0]
-
-            file_end = len(data)
-            sections = []
-            scan_pos = header_end
-            while scan_pos + 8 <= file_end:
-                sec_end_val = struct.unpack('>I', data[scan_pos + 4:scan_pos + 8])[0]
-                if sec_end_val <= scan_pos or sec_end_val > file_end:
-                    break
-                sections.append((scan_pos, sec_end_val))
-                scan_pos = sec_end_val
+            header_end = check_file_header(data, path)
+            sections, truncated = section_chain(data, header_end)
+            if truncated:
+                # An operating point with devices silently missing is worse
+                # than no result: Spectre writes these files in one go.
+                raise ValueError(
+                    f"{path}: truncated PSF file (a section runs past the end "
+                    f"of the {len(data)}-byte file)")
 
             if len(sections) < 2:
                 return np.array([0.0]), {}, []

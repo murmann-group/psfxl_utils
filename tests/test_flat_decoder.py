@@ -75,3 +75,45 @@ def test_inconsistent_later_point_falls_back():
     stride = (len(data) - 4) // 3
     struct.pack_into('>I', data, 2 * stride + 4, 12)   # corrupt point 3's sweep EID
     assert _decode_by_header_layout(bytes(data), 0, len(data), SWEEP, TRACES) is None
+
+
+# --- Truncated files --------------------------------------------------------
+
+from psfxl_utils.psf_parse import section_chain
+
+
+def test_truncated_value_section_returns_complete_points_only():
+    data = value_section(POINTS)[:-4]            # drop the end tag ...
+    cut = data[:len(data) - 10]                   # ... and cut into point 3
+    sweep, sig = _decode_by_header_layout(cut, 0, len(cut), SWEEP, TRACES,
+                                          truncated=True)
+    np.testing.assert_array_equal(sweep, [p[0] for p in POINTS[:2]])
+    assert all(len(a) == 2 for a in sig.values())
+
+
+@pytest.mark.parametrize('cut_at', [20, 40, 60])
+def test_truncation_inside_first_point_is_refused(cut_at):
+    data = value_section(POINTS)[:cut_at]
+    assert _decode_by_header_layout(data, 0, len(data), SWEEP, TRACES,
+                                    truncated=True) is None
+
+
+def test_section_chain_flags_a_section_running_past_eof():
+    hdr = struct.pack('>III', 0x200, 0, 12)
+    s1 = struct.pack('>II', 0x15, 12 + 16) + b'\x00' * 8
+    s2 = struct.pack('>II', 0x15, 28 + 100) + b'\x00' * 20      # cut short
+    sections, truncated = section_chain(hdr + s1 + s2, 12)
+    assert truncated and sections == [(12, 28), (28, 56)]
+    sections, truncated = section_chain(hdr + s1, 12)
+    assert not truncated and sections == [(12, 28)]
+
+
+def test_truncated_info_file_raises(tmp_path):
+    from psfxl_utils.oppoint_psf_decoder import decode_psf_info
+    p = tmp_path / 'dcOp.dc'
+    p.write_bytes(struct.pack('>III', 0x500, 0, 12) + struct.pack('>II', 0x15, 500))
+    with pytest.raises(ValueError, match='truncated'):
+        decode_psf_info(p)
+    p.write_bytes(b'\x00\x00\x05')
+    with pytest.raises(ValueError, match='truncated'):
+        decode_psf_info(p)

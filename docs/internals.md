@@ -87,6 +87,17 @@ path that scans for `TAG_ENTRY` markers and reads only the first value of
 each record. The sparse path warns, since it loses imaginary parts and
 noise components.
 
+**Truncated files.** Sections are walked by one helper
+(`psf_parse.section_chain`) shared by the header parser and the decoders.
+If a flat file's last section runs past the end of the file, it is taken as
+the VALUE section (checked: the complete sections before it must name the
+traces), and only the header-derived layout is used: the complete sweep points
+are returned with a `RuntimeWarning`, and a file cut inside its first point or
+its metadata raises `ValueError`. A truncated operating-point (0x500) file
+raises `ValueError`, since a snapshot with devices missing is worse than none.
+A cut that only removes the trailer (offset table and `Clarissa` marker)
+leaves every section intact and decodes in full.
+
 Noise files may store per-mechanism device contributions inline after each
 device's total value (GROUP types). The header parser synthesizes virtual
 sub-traces (`<device>.<mechanism>`) for these, and the decoder extracts them
