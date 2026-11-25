@@ -29,7 +29,7 @@ reduce repeated load times:
    changes between loads within the same Python process.
 
 2. **Disk cache** — decoded objects are pickled to
-   ``~/.cache/psfxl_utils/``.  Subsequent loads from a new Python session
+   ``$PSFXL_UTILS_CACHE_DIR`` (default ``~/.cache/psfxl_utils/``).  Subsequent loads from a new Python session
    take ~50 ms instead of ~1.5 s.
 
 Public Interface

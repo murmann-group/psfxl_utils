@@ -30,7 +30,8 @@ surface.
 
 1. **Memory cache probe** — if the path was loaded before in this process
    and the file's SHA-256 hash is unchanged, reuse the decoded arrays.
-2. **Disk cache probe** — if `~/.cache/psfxl_utils/` holds a pickle whose
+2. **Disk cache probe** — if the cache directory (`$PSFXL_UTILS_CACHE_DIR`,
+   default `~/.cache/psfxl_utils/`) holds a pickle whose
    embedded mtime matches the source file, load it (and promote it to the
    memory cache).
 3. **Full decode** — read the first 4 bytes of the file and dispatch on the
@@ -134,7 +135,7 @@ Two transparent layers, both managed by `PSF.__init__`:
 | Layer | Store | Invalidation |
 |-------|-------|--------------|
 | Memory (per process) | `PSF._instance_cache` dict | SHA-256 hash of the source file, recomputed on every hit |
-| Disk (across sessions) | `~/.cache/psfxl_utils/*.pkl` | nanosecond mtime **and** library source hash, both embedded in the cache filename |
+| Disk (across sessions) | `$PSFXL_UTILS_CACHE_DIR/*.pkl`, default `~/.cache/psfxl_utils/*.pkl` | nanosecond mtime **and** library source hash, both embedded in the cache filename |
 
 **Memory layer.** Keyed by resolved path. On every lookup the source file is
 re-hashed; a hash mismatch (file changed on disk) forces a reload. This makes
@@ -153,20 +154,34 @@ trigger a re-decode.
 invalidate the cache too. Without it, a decoder fix silently does nothing on
 any file already cached: `decode_psfxl()` returns the corrected waveform while
 `PSF()` keeps serving the pre-fix pickle for the same path and mtime, and the
-only way out is deleting `~/.cache/psfxl_utils` by hand. Hashing the source
+only way out is deleting the cache directory by hand. Hashing the source
 rather than a declared version number also covers uncommitted local edits.
 
 When a new cache entry is written, entries for older mtimes *and* older
 library hashes of the same source file are deleted, so neither repeated
 simulation nor repeated upgrades let the directory grow without bound.
-`clear_all()` wipes the whole cache directory.
+`clear_all()` deletes only top-level files whose names match the entry format
+above, never the directory itself, subdirectories or other files (including
+unrelated `.pkl` files).
+
+**Location.** `psf_cache.get_cache_dir()` returns `$PSFXL_UTILS_CACHE_DIR`
+when the variable is set and not blank, else `~/.cache/psfxl_utils`. `~` is
+expanded (an unknown `~user` is ignored with a warning). A relative path is
+resolved against the current directory on every access, so it moves if the
+process changes directory; use an absolute path. The variable is read on every
+cache access, so changing it after import takes effect immediately. If the
+directory cannot be created, the disk layer is skipped and `PSF()` still
+decodes. A directory created for an override gets mode `0700`.
 
 Corrupted or unreadable cache files are treated as cache misses; cache write
 failures are silently ignored (the decode result is still returned).
 
 **Trust model.** Cache entries are pickles, and unpickling executes code.
-The cache lives in the per-user `~/.cache/psfxl_utils/` directory and must
-not be redirected to a shared or otherwise untrusted location.
+The cache lives in the per-user `~/.cache/psfxl_utils/` directory by default.
+If `PSFXL_UTILS_CACHE_DIR` redirects it, the target must likewise be writable
+only by you. This is enforced: if the override directory is not owned by you or
+is group/world-writable, the disk cache is disabled with a `RuntimeWarning`.
+(The default location is not checked, to keep its previous behaviour.)
 
 **Warnings and caching.** Warnings emitted during a decode (e.g. skipped
 checkpoint chunks of an interrupted simulation) are stored on the PSF object
