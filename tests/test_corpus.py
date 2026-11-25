@@ -1,7 +1,8 @@
 """Invariants over a directory of real Spectre results (opt-in).
 
 Set ``PSFXL_TEST_CORPUS`` to a directory; every PSFXL result (``*.psfxl``
-beside its header) and flat PSF file (magic 0x200) found under it is
+beside its header), flat PSF file (magic 0x200) and operating-point file
+(magic 0x500) found under it is
 decoded, and the test fails on the first file that breaks an invariant:
 
 * every signal has exactly the length of the sweep;
