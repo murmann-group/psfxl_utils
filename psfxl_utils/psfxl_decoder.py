@@ -1,5 +1,6 @@
 """PSFXL-specific decoder for .tran/.tran.psfxl file pairs."""
 
+import bisect
 import struct
 import threading
 import warnings
@@ -65,80 +66,6 @@ if not _BLOSC_AVAILABLE and not _NUMCODECS_AVAILABLE:
          "Install one of them to use PSFXL decoding: "
          "pip install blosc OR pip install numcodecs"
      )
-
-
-BLOSC_MAGIC = b'\x02\x01\x01\x08'
-
-# Maximum expected blosc overhead (128 bytes generously covers all versions)
-_BLOSC_MAX_OVERHEAD = 128
-
-
-def _find_blosc_header(data, start, end, expected_nbytes=None):
-    """Locate a valid blosc1 header in data[start:end].
-
-    This is more robust than searching for the fixed BLOSC_MAGIC pattern
-    (b'\\x02\\x01\\x01\\x08') because that pattern encodes specific flag and
-    versionlz bytes that can legitimately differ between files:
-
-    - Byte 0: blosc version, always 0x02 for blosc1
-    - Byte 1: versionlz, depends on compressor (blosclz=0x01, but lz4=0x02 etc.)
-    - Byte 2: flags (0x00=NOSHUFFLE, 0x01=SHUFFLE, 0x02=BITSHUFFLE, etc.)
-    - Byte 3: typesize (itemsize of the uncompressed data, 1/2/4/8)
-    - Bytes 4-7:  nbytes   (uncompressed size, LE uint32)
-    - Bytes 8-11: blocksize (LE uint32)
-    - Bytes 12-15: cbytes  (compressed size including 16-byte header, LE uint32)
-
-    If expected_nbytes is given, only a header whose nbytes field matches is
-    accepted. This acts as a strong fingerprint: for float64 PSFXL data,
-    expected_nbytes = num_points * 8, which uniquely identifies the correct
-    block even if multiple blosc headers appear nearby.
-
-    Returns the byte offset of the header within ``data``, or -1.
-    """
-    pos = start
-    while pos < end:
-        # Blosc1 always starts with version byte 0x02.
-        # We accept any versionlz (byte 1) since it varies by compressor.
-        idx = data.find(b'\x02', pos, end)
-        if idx == -1 or idx + 16 > len(data):
-            break
-        try:
-            # versionlz must be non-zero; typesize must be a power-of-two <= 16
-            versionlz = data[idx + 1]
-            typesize   = data[idx + 3]
-            if versionlz == 0 or typesize == 0 or typesize > 16:
-                pos = idx + 1
-                continue
-
-            nbytes, blocksize, cbytes = struct.unpack_from('<3I', data, idx + 4)
-
-            # Structural sanity checks on the header fields:
-            #   cbytes  >= 16           (at minimum the header itself)
-            #   nbytes  >= blocksize    (block cannot exceed total)
-            #   blocksize > 0           (always set, even for single-block data)
-            #   cbytes  <= nbytes + _BLOSC_MAX_OVERHEAD  (compressed >= uncompressed rare but ok)
-            #   idx + cbytes fits inside the file
-            if not (cbytes >= 16
-                    and nbytes > 0
-                    and blocksize > 0
-                    and blocksize <= nbytes
-                    and cbytes <= nbytes + _BLOSC_MAX_OVERHEAD
-                    and idx + cbytes <= len(data)):
-                pos = idx + 1
-                continue
-
-            # If caller supplied the expected uncompressed size, use it as
-            # the decisive fingerprint.  This avoids false positives caused
-            # by 0x02 bytes that happen to sit in the scan window.
-            if expected_nbytes is not None and nbytes != expected_nbytes:
-                pos = idx + 1
-                continue
-
-            return idx
-        except Exception:
-            pass
-        pos = idx + 1
-    return -1
 
 
 def _blosc_decompress(buf):
@@ -282,13 +209,131 @@ def parse_sig_file(sig_path):
     return metadata
 
 
-def _scan_chunk_headers(data):
-    """Pre-scan the PSFXL file for all valid chunk headers.
+try:  # optional fast path; the pure-Python decoder below is the fallback
+    import lz4.block as _lz4_block
+except ImportError:
+    _lz4_block = None
 
-    Returns list of (offset, data_start, seq, num_points, chunk_size, flag, ref)
-    tuples, sorted by offset. `flag` is the encoding byte Spectre writes for the
-    chunk and `ref` is the trailing `<back_offset>.<length>` field that
-    accompanies a back-reference; both are needed to decode correctly.
+
+def _lz4_decompress_block(src, out_len):
+    """Decompress one raw LZ4 *block* (no frame header) to exactly *out_len* bytes.
+
+    Spectre stores a few short type-3 blocks this way (flag digit ``1``).
+    Raises ValueError if the block is malformed or decodes to another length.
+    """
+    if _lz4_block is not None:
+        out = _lz4_block.decompress(bytes(src), uncompressed_size=out_len)
+        if len(out) != out_len:
+            raise ValueError(f"LZ4 block decoded to {len(out)} bytes, expected {out_len}")
+        return out
+    return _lz4_pure(bytes(src), out_len)
+
+
+def _lz4_pure(src, out_len):
+    """Pure-Python LZ4 block decoder: exactly *out_len* bytes or ValueError."""
+    try:
+        return _lz4_pure_unchecked(src, out_len)
+    except IndexError:  # ran off the end of the block mid-sequence
+        raise ValueError("LZ4 block is truncated") from None
+
+
+def _lz4_pure_unchecked(src, out_len):
+    """Decode loop; never produces more than *out_len* bytes."""
+    out = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        token = src[i]
+        i += 1
+        lit = token >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        if len(out) + lit > out_len or i + lit > n:
+            raise ValueError("LZ4 literal run exceeds the block or the output size")
+        out += src[i:i + lit]
+        i += lit
+        if i >= n:
+            break  # the last sequence carries literals only
+        off = src[i] | (src[i + 1] << 8)
+        i += 2
+        mlen = token & 15
+        if mlen == 15:
+            while True:
+                b = src[i]
+                i += 1
+                mlen += b
+                if b != 255:
+                    break
+        mlen += 4
+        start = len(out) - off
+        if off == 0 or start < 0:
+            raise ValueError("LZ4 block has an invalid match offset")
+        if len(out) + mlen > out_len:
+            raise ValueError("LZ4 match exceeds the output size")
+        if off >= mlen:
+            out += out[start:start + mlen]
+        else:  # overlapping match: each byte may be one just written
+            for k in range(mlen):
+                out.append(out[start + k])
+    if len(out) != out_len:
+        raise ValueError(f"LZ4 block decoded to {len(out)} bytes, expected {out_len}")
+    return bytes(out)
+
+
+class _ChunkError(Exception):
+    """A type-3 block that cannot be decoded; the message says why."""
+
+
+class _Chunk:
+    """One parsed type-3 chunk header (``\\x003:seq:?:npts:csize:flag:...``)."""
+    __slots__ = ('offset', 'data_start', 'payload', 'seq', 'num_points',
+                 'chunk_size', 'flag', 'fields')
+
+    def __init__(self, offset, data_start, seq, num_points, chunk_size, flag, fields):
+        self.offset = offset            # position of the leading \x00
+        self.data_start = data_start    # first byte after the header's \n
+        # Payload follows an alignment pad of 8 - (data_start % 8) bytes:
+        # always 1-8, never 0, emitted even when data_start is aligned.
+        self.payload = data_start + 8 - (data_start % 8)
+        self.seq = seq
+        self.num_points = num_points
+        self.chunk_size = chunk_size
+        self.flag = flag
+        self.fields = fields            # header fields after the flag, as text
+
+    @property
+    def ref(self):
+        """The ``<back_offset>.<length>`` field of a back-reference chunk."""
+        return self.fields[1] if len(self.fields) > 1 else ''
+
+    def compressed_sizes(self):
+        """Sizes listed after the flag of a seq-0 chunk, one per compressed block."""
+        sizes = []
+        for f in self.fields:
+            if '.' in f:
+                break
+            try:
+                sizes.append(int(f, 16))
+            except ValueError:
+                break
+        return sizes
+
+
+def _scan_chunk_headers(data):
+    """Find every type-3 chunk header, walking the file from chunk to chunk.
+
+    A header is ``\\x003:seq:?:num_points:chunk_size:flag[:field...]\\n``
+    followed by an alignment pad and ``chunk_size`` payload bytes; the next
+    header (of any type) starts after that payload.  The search for the next
+    header therefore resumes at the end of the current payload, so a
+    ``\\x003:`` byte sequence that happens to occur inside compressed or raw
+    data is never mistaken for a header.
+
+    Returns a list of :class:`_Chunk`, in file order.
     """
     chunks = []
     pos = 0
@@ -298,35 +343,268 @@ def _scan_chunk_headers(data):
             break
         try:
             nl = data.index(b'\n', idx, idx + 300)
-            text = data[idx+1:nl].decode('ascii', errors='replace')
-            parts = text.split(':')
+            parts = data[idx + 1:nl].decode('ascii').split(':')
             seq = int(parts[1], 16)
             num_points = int(parts[3], 16)
-            size_field = parts[4] if len(parts) > 4 else '0'
-            if '.' in size_field:
-                size_field = size_field.split('.')[0]
-            chunk_size = int(size_field, 16)
-            flag = parts[5] if len(parts) > 5 else ''
-            ref = parts[7] if len(parts) > 7 else ''
-            chunks.append((idx, nl + 1, seq, num_points, chunk_size, flag, ref))
-        except (ValueError, IndexError):
-            pass
-        pos = idx + 1
+            chunk_size = int(parts[4].split('.')[0], 16) if len(parts) > 4 else 0
+        except (ValueError, IndexError, UnicodeDecodeError):
+            pos = idx + 1
+            continue
+        chunk = _Chunk(idx, nl + 1, seq, num_points, chunk_size,
+                       parts[5] if len(parts) > 5 else '', parts[6:])
+        end = chunk.payload + chunk_size if chunk_size else chunk.data_start
+        if end > len(data):
+            # Declared payload runs past EOF: a truncated final chunk, or a
+            # false match.  Keep it (decoding will report it) but do not jump.
+            chunks.append(chunk)
+            pos = idx + 1
+            continue
+        chunks.append(chunk)
+        pos = max(end, idx + 1)
     return chunks
+
+
+def _decode_blosc(data, start, size, num_points):
+    """Decode a blosc block of exactly *size* bytes at *start*."""
+    if start + 16 > len(data) or start + size > len(data):
+        raise _ChunkError("blosc block runs past end of file")
+    if data[start] != 2:
+        raise _ChunkError(f"no blosc header (version byte 0x{data[start]:02x})")
+    nbytes, _blocksize, cbytes = struct.unpack_from('<3I', data, start + 4)
+    if nbytes != num_points * 8:
+        raise _ChunkError(f"blosc nbytes {nbytes} != {num_points} points * 8")
+    if cbytes != size:
+        raise _ChunkError(f"blosc cbytes {cbytes} != block size {size}")
+    try:
+        out = _blosc_decompress(data[start:start + size])
+    except Exception as exc:
+        raise _ChunkError(f"blosc decompression failed: {exc}") from exc
+    if len(out) != num_points * 8:
+        raise _ChunkError(f"blosc produced {len(out)} bytes, expected {num_points * 8}")
+    return np.frombuffer(out, dtype='<f8')
+
+
+def _decode_block(data, start, size, digit, num_points):
+    """Decode one block of *size* bytes at *start* encoded per flag *digit*.
+
+    ``2`` = blosc, ``1`` = raw LZ4 block, ``0`` = uncompressed: either an
+    array of ``num_points`` little-endian doubles or, when the block is
+    8 bytes, one double repeated (a constant signal).
+    """
+    if start + size > len(data):
+        raise _ChunkError("block runs past end of file")
+    if digit == '2':
+        return _decode_blosc(data, start, size, num_points)
+    if digit == '1':
+        try:
+            out = _lz4_decompress_block(data[start:start + size], num_points * 8)
+        except Exception as exc:
+            raise _ChunkError(f"LZ4 decompression failed: {exc}") from exc
+        return np.frombuffer(out, dtype='<f8')
+    if digit == '0':
+        if size == num_points * 8:
+            return np.frombuffer(data[start:start + size], dtype='<f8')
+        if size == 8:
+            return np.full(num_points, struct.unpack_from('<d', data, start)[0])
+        raise _ChunkError(f"uncompressed block of {size} bytes is neither "
+                          f"{num_points} doubles nor one constant")
+    raise _ChunkError(f"unknown encoding digit {digit!r}")
+
+
+def _decode_seq0(data, chunk):
+    """Decode a seq-0 chunk into ``(time, signal_0)``.
+
+    The payload is the time block immediately followed (no pad) by signal
+    0's block.  The flag's two hex digits give their encodings, time first;
+    a missing flag means both are uncompressed.  The fields after the flag
+    list the size of each compressed block in order.  Raises _ChunkError if
+    the time block cannot be decoded; a signal-0 failure is returned as the
+    exception in place of the array.
+    """
+    npts = chunk.num_points
+    flag = (chunk.flag or '0').zfill(2)
+    if len(flag) != 2:
+        raise _ChunkError(f"unknown seq-0 flag {chunk.flag!r}")
+    t_digit, s_digit = flag
+    sizes = chunk.compressed_sizes()
+    if chunk.chunk_size == 0:
+        raise _ChunkError("seq-0 chunk has zero size")
+
+    if t_digit == '0':
+        t_size = npts * 8
+    elif t_digit == '2' and chunk.payload + 16 <= len(data):
+        t_size = struct.unpack_from('<I', data, chunk.payload + 12)[0]
+    elif t_digit in '12' and sizes:
+        t_size = sizes[0]
+    else:
+        raise _ChunkError(f"cannot size time block (flag {chunk.flag!r})")
+    if t_digit in '12' and sizes and sizes[0] != t_size:
+        raise _ChunkError(f"time block is {t_size} bytes but the header lists {sizes[0]}")
+    s_size = chunk.chunk_size - t_size
+    if s_size <= 0:
+        raise _ChunkError(f"time block ({t_size} bytes) fills the {chunk.chunk_size}-byte chunk")
+
+    time = _decode_block(data, chunk.payload, t_size, t_digit, npts)
+    if npts > 1 and np.any(np.diff(time) < 0):
+        raise _ChunkError("decoded time block is not increasing")
+    try:
+        sig0 = _decode_block(data, chunk.payload + t_size, s_size, s_digit, npts)
+    except _ChunkError as exc:
+        sig0 = exc
+    return time, sig0
+
+
+def _resolve_back_reference(data, chunk):
+    """Decode the block a zero-size chunk points at.
+
+    A zero-size chunk is NOT a run of zeros. Spectre writes it when this
+    signal's data for this flush is byte-identical to a block already in the
+    file (two clock phases with the same duty, a bus whose bits carry the
+    same code) and points at that block with a trailing
+    ``<back_offset>.<length>`` field: the block starts ``back_offset`` bytes
+    before this chunk header and its compressed size is ``length``.
+    """
+    try:
+        back_s, length_s = chunk.ref.split('.')[:2]
+        back, length = int(back_s, 16), int(length_s, 16)
+    except ValueError:
+        raise _ChunkError(f"zero-size chunk with unreadable reference {chunk.ref!r}")
+    src = chunk.offset - back
+    if src < 0:
+        raise _ChunkError(f"back-reference {chunk.ref!r} points before the file start")
+    return _decode_blosc(data, src, length, chunk.num_points)
+
+
+def _decode_seqn(data, chunk):
+    """Decode a seq >= 1 chunk (one signal) per the low digit of its flag."""
+    digit = chunk.flag[-1:] or '0'
+    if chunk.chunk_size == 0:
+        if digit not in ('a', ''):
+            raise _ChunkError(f"zero-size chunk with flag {chunk.flag!r}")
+        return _resolve_back_reference(data, chunk)
+    return _decode_block(data, chunk.payload, chunk.chunk_size, digit, chunk.num_points)
+
+
+class _Problems:
+    """Collects decode problems so they can be reported in one warning."""
+
+    def __init__(self):
+        self.items = []   # (offset, seq, reason)
+
+    def add(self, offset, seq, reason):
+        self.items.append((offset, seq, str(reason)))
+
+    def warn(self, data_path, what):
+        if not self.items:
+            return
+        shown = '; '.join(f"seq {s} at offset {o}: {r}" for o, s, r in self.items[:5])
+        more = f"; and {len(self.items) - 5} more" if len(self.items) > 5 else ''
+        warnings.warn(f"psfxl: {len(self.items)} {what} in {data_path} ({shown}{more})",
+                      RuntimeWarning, stacklevel=3)
+
+
+def _decode_type3_flushes(data, num_traces, chunks, bad_chunks, dropped):
+    """Decode type-3 chunks into flushes.
+
+    A flush is a seq-0 chunk (time + signal 0) followed by seq 1..N-1, all
+    with the same number of points.  Returns a list of
+    ``(offset, 't3', time, signals)`` with one array per signal index; a
+    signal whose block is missing or undecodable is NaN for that flush so
+    that every signal stays aligned with the time axis.
+    """
+    flushes = []
+    current = None  # (chunk0, time, {seq: array})
+    in_dropped_flush = False
+
+    def finish():
+        if current is None:
+            return
+        c0, time, sigs = current
+        for i in range(num_traces):
+            if i not in sigs:
+                bad_chunks.add(c0.offset, i, "block missing from flush")
+                sigs[i] = np.full(len(time), np.nan)
+        flushes.append((c0.offset, 't3', time, sigs))
+
+    for chunk in chunks:
+        if chunk.num_points == 0:
+            continue
+        if chunk.seq == 0:
+            finish()
+            current = None
+            in_dropped_flush = False
+            try:
+                time, sig0 = _decode_seq0(data, chunk)
+            except _ChunkError as exc:
+                dropped.add(chunk.offset, 0, exc)
+                in_dropped_flush = True
+                continue
+            sigs = {}
+            if isinstance(sig0, Exception):
+                bad_chunks.add(chunk.offset, 0, sig0)
+                sigs[0] = np.full(len(time), np.nan)
+            else:
+                sigs[0] = sig0
+            current = (chunk, time, sigs)
+            continue
+        if current is None:
+            # Belongs to a flush whose seq-0 chunk failed (already reported)
+            # or that has no seq-0 chunk at all.
+            if not in_dropped_flush:
+                dropped.add(chunk.offset, chunk.seq, "chunk outside any flush")
+            continue
+        c0, time, sigs = current
+        if chunk.seq >= num_traces:
+            bad_chunks.add(chunk.offset, chunk.seq,
+                           f"signal index beyond the {num_traces} traces in the header")
+            continue
+        if chunk.num_points != len(time):
+            bad_chunks.add(chunk.offset, chunk.seq,
+                           f"{chunk.num_points} points in a {len(time)}-point flush")
+            continue
+        if chunk.seq in sigs:
+            bad_chunks.add(chunk.offset, chunk.seq, "duplicate block in flush")
+            continue
+        try:
+            sigs[chunk.seq] = _decode_seqn(data, chunk)
+        except _ChunkError as exc:
+            bad_chunks.add(chunk.offset, chunk.seq, exc)
+            sigs[chunk.seq] = np.full(len(time), np.nan)
+    finish()
+    return flushes
+
+
+def _merge_intervals(intervals):
+    """Sort and merge ``(start, end)`` intervals so they do not overlap."""
+    merged = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _inside(intervals, pos):
+    """True if *pos* lies inside one of the merged ``(start, end)`` intervals."""
+    i = bisect.bisect_right(intervals, (pos, float('inf'))) - 1
+    return i >= 0 and intervals[i][0] <= pos < intervals[i][1]
 
 
 def _find_type2_chunks(data):
     """Find type-2 chunk headers (uncompressed flush chunks).
 
-    Type-2 format: \x002:seq:?:num_traces:num_points:binary_size\n
-    Followed by ASCII hex index table, null padding to 8-byte alignment,
-    then raw little-endian IEEE 754 doubles laid out as
-    (num_traces+1) groups of num_points values (time + each signal).
+    Type-2 format: \\x002:seq:?:num_traces:num_points:binary_size\\n
+    Followed by an ASCII hex index table, an alignment pad, then raw
+    little-endian IEEE 754 doubles laid out as (num_traces+1) groups of
+    num_points values (time + each signal).
 
-    Scans the entire file and returns every structurally valid type-2 chunk.
-    Callers are responsible for deciding which chunks represent genuine
-    end-of-simulation flushes versus intermediate in-flight checkpoints;
-    use :func:`_filter_type2_chunks` for that classification.
+    The pad after the index table is ``8 - (pos % 8)`` bytes -- 1-8, never
+    0 -- like the type-1 pad.  It must be computed, not found by skipping
+    null bytes: a first time sample of 0.0 is eight null bytes and would be
+    consumed as padding, shifting every signal by one sample.
+
+    Returns ``(doubles_start, num_traces, num_points, binary_size)`` tuples.
     """
     chunks = []
     pos = 0
@@ -344,22 +622,17 @@ def _find_type2_chunks(data):
                 binary_size = int(parts[5], 16)
                 expected = (num_traces_c + 1) * num_points * 8
                 if binary_size == expected and num_points > 0:
-                    # Skip ASCII index table: scan forward while bytes are
-                    # printable ASCII or newlines (the index table is text).
+                    # The index table is printable text and newlines.
                     scan_pos = nl + 1
                     while scan_pos < len(data):
                         b = data[scan_pos]
-                        if b < 0x20 and b != 0x0a:
-                            break
-                        if b > 0x7e:
+                        if (b < 0x20 and b != 0x0a) or b > 0x7e:
                             break
                         scan_pos += 1
-                    # Skip ALL null padding bytes (amount is variable and can
-                    # exceed 8 bytes; just aligning to the next 8-byte boundary
-                    # is not sufficient and can leave scan_pos in the padding).
-                    while scan_pos < len(data) and data[scan_pos] == 0x00:
-                        scan_pos += 1
-                    chunks.append((scan_pos, num_traces_c, num_points, binary_size))
+                    doubles_start = scan_pos + 8 - (scan_pos % 8)
+                    if doubles_start + binary_size <= len(data):
+                        chunks.append((doubles_start, num_traces_c, num_points,
+                                       binary_size))
             pos = nl + 1 if nl > idx else idx + 1
         except (ValueError, IndexError):
             pos = idx + 1
@@ -369,15 +642,15 @@ def _find_type2_chunks(data):
 def _find_type1_chunks(data):
     """Find type-1 chunk headers (uncompressed, no index table).
 
-    Type-1 format: \x001:seq:?:num_points:binary_size\n
+    Type-1 format: \\x001:seq:?:num_points:binary_size\\n
     Followed by an 8-byte alignment pad, then raw little-endian IEEE 754
     doubles laid out as (num_traces+1) groups of num_points values
     (time + each signal) -- the same grouped payload as type-2.
 
-    Spectre writes a single type-1 chunk for the whole flush when the data
-    compresses badly enough that it does not use the per-signal
-    blosc-compressed type-3 blocks.  The container is chosen by how well the
-    data compresses, not by how many signals were saved.
+    Spectre writes a type-1 chunk for a flush that compresses badly enough
+    that it does not use the per-signal blosc-compressed type-3 blocks, so a
+    file can mix them: in many runs the first flush is type-1 and every
+    later one type-3.
 
     Two differences from type-2, both of which corrupt a decode if missed:
 
@@ -387,15 +660,12 @@ def _find_type1_chunks(data):
     2. There is no ASCII index table, but there IS an alignment pad of
        ``8 - (offset % 8)`` bytes: always 1-8, never 0, emitted even when the
        offset is already 8-byte aligned.  Do *not* locate the payload by
-       scanning past null bytes the way the type-2 reader does: the first
-       payload value is the first time point, which is legitimately ``0.0``
-       and therefore eight null bytes indistinguishable from padding.
-       Scanning past them consumes the start of the time axis, shifting every
-       signal by one sample and dropping the last.
+       scanning past null bytes: the first payload value is the first time
+       point, which is legitimately ``0.0`` and therefore eight null bytes
+       indistinguishable from padding.
 
     Returns ``(doubles_start, num_traces, num_points, binary_size)`` tuples
-    shaped to match :func:`_find_type2_chunks`, so the existing filter and
-    consumer handle them unchanged.
+    shaped to match :func:`_find_type2_chunks`.
     """
     chunks = []
     pos = 0
@@ -433,61 +703,23 @@ def _find_type1_chunks(data):
     return chunks
 
 
-def _filter_type2_chunks(type2_chunks, data, last_t3_time):
-    """Classify type-2 chunks as final flushes or stale intermediate checkpoints.
-
-    During a normal simulation Spectre compresses signal data into type-3
-    (blosc-compressed) blocks.  It also periodically writes small uncompressed
-    type-2 checkpoint records.  When those checkpoints are later covered by
-    type-3 blocks the checkpoint data is redundant — including it would
-    duplicate or back-track the time axis.  This happens in particular when a
-    simulation is interrupted before it finishes: the last type-2 checkpoint
-    written was at some earlier simulation time, while all the type-3 data
-    extends to a later time.
-
-    The rule is simple: a type-2 chunk whose first time value is less than or
-    equal to ``last_t3_time`` has already been captured by the type-3 decoder
-    and must be skipped.  Only a chunk whose first time value is strictly
-    greater than ``last_t3_time`` contains genuinely new data (a true
-    end-of-simulation flush).
-
-    The classification is based entirely on the simulation-time content of
-    each chunk, not on file offsets, so it remains correct regardless of how
-    Spectre orders sections within the file.
-
-    Parameters
-    ----------
-    type2_chunks : list
-        List of ``(doubles_start, nt2, npts2, bsize2)`` tuples as returned by
-        :func:`_find_type2_chunks`.
-    data : bytes
-        Raw file contents (used to peek at each chunk's first time value).
-    last_t3_time : float
-        Last time value decoded from type-3 (compressed) chunks, or
-        ``-numpy.inf`` if no type-3 data was found.
-
-    Returns
-    -------
-    valid : list
-        Chunks to include (first time > last_t3_time).
-    skipped : list of float
-        First-time value of each skipped intermediate checkpoint, for use in
-        warning messages.
-    """
-    valid = []
-    skipped = []
-    for doubles_start, nt2, npts2, bsize2 in type2_chunks:
-        if doubles_start + bsize2 > len(data):
-            continue
-        # Peek at the first 8 bytes of the data region: in the grouped layout
-        # (num_traces+1, npts2) the first float64 is always the earliest time
-        # value in the chunk.
-        first_time = struct.unpack_from('<d', data, doubles_start)[0]
-        if first_time > last_t3_time:
-            valid.append((doubles_start, nt2, npts2, bsize2))
-        else:
-            skipped.append(first_time)
-    return valid, skipped
+def _grouped_flushes(data, found, kind, num_traces, bad_chunks):
+    """Turn type-1/type-2 chunk tuples into ``(offset, kind, time, signals)``."""
+    flushes = []
+    for doubles_start, nt, npts, bsize in found:
+        groups = np.frombuffer(data[doubles_start:doubles_start + bsize],
+                               dtype='<f8').reshape(nt + 1, npts)
+        sigs = {}
+        for i in range(num_traces):
+            if i < nt:
+                sigs[i] = groups[1 + i]
+            else:
+                sigs[i] = np.full(npts, np.nan)
+        if nt < num_traces:
+            bad_chunks.add(doubles_start, nt,
+                           f"type-{kind[1]} flush holds {nt} of {num_traces} signals")
+        flushes.append((doubles_start, kind, groups[0], sigs))
+    return flushes
 
 
 def decode_psfxl(data_path, num_traces):
@@ -499,258 +731,110 @@ def decode_psfxl(data_path, num_traces):
 
     Returns:
         (time_array, signal_arrays, flush_count) where signal_arrays is a dict
-        mapping signal index (0..num_traces-1) to numpy arrays.
+        mapping signal index (0..num_traces-1) to numpy arrays, each the same
+        length as time_array.  Samples that could not be decoded are NaN, and
+        a RuntimeWarning says which chunks were affected.
+
+    The file is a sequence of flushes, each stored in one of three
+    containers: type-3 (one block per signal, each blosc, LZ4, uncompressed
+    or a back-reference, as the chunk's flag says), type-1 or type-2 (all
+    signals uncompressed in one block).  A file can mix them.  Flushes are
+    assembled by start time, which in real files is also file order; a flush
+    whose time range is already covered by earlier data (a stale checkpoint)
+    is skipped, and one that overlaps is trimmed to its new samples.
     """
     with open(data_path, 'rb') as f:
         data = f.read()
 
-    # Pass 1: find all chunk headers
+    bad_chunks = _Problems()   # signal blocks replaced by NaN
+    dropped = _Problems()      # whole flushes lost (time block undecodable)
+
+    # Each container's marker bytes can also occur by chance inside another
+    # container's payload.  Type-3 payloads (that end inside the file) mask
+    # type-1/type-2 candidates; the type-1/type-2 flushes that survive then
+    # mask type-3 headers inside their payloads.
     chunks = _scan_chunk_headers(data)
+    t3_payloads = _merge_intervals(
+        (c.payload, c.payload + c.chunk_size) for c in chunks
+        if c.chunk_size and c.payload + c.chunk_size <= len(data))
+    grouped = []
+    masked = 0
+    for kind, found in (('t2', _find_type2_chunks(data)), ('t1', _find_type1_chunks(data))):
+        keep = []
+        for chunk in found:
+            if _inside(t3_payloads, chunk[0]):
+                masked += 1
+            else:
+                keep.append(chunk)
+        grouped.append((kind, keep))
+    grouped_payloads = _merge_intervals(
+        (c[0], c[0] + c[3]) for _, found in grouped for c in found)
+    chunks = [c for c in chunks if not _inside(grouped_payloads, c.offset)]
+
+    flushes = _decode_type3_flushes(data, num_traces, chunks, bad_chunks, dropped)
+    for kind, found in grouped:
+        flushes += _grouped_flushes(data, found, kind, num_traces, bad_chunks)
+    # Assemble in time order, which in every file examined is also file order;
+    # on equal start times prefer a type-3 flush, then the longer one.  Sorting
+    # by time (not offset) keeps a checkpoint record that appears out of order
+    # from displacing the flush that covers it.
+    flushes.sort(key=lambda fl: (fl[2][0] if len(fl[2]) else np.inf,
+                                 fl[1] != 't3', -len(fl[2]), fl[0]))
 
     all_time = []
     all_signals = {i: [] for i in range(num_traces)}
-    flush_count = 0
-
-    # Pass 2: process each chunk in order
-    for offset, data_start, seq, num_points, chunk_size, flag, ref in chunks:
-        if num_points == 0:
+    end = -np.inf
+    covered = []    # (kind, first time) of flushes skipped as already covered
+    trimmed = 0
+    for offset, kind, time, sigs in flushes:
+        if len(time) == 0:
             continue
-
-        # A zero-size chunk is NOT a run of zeros. Spectre writes it when this
-        # signal's data for this flush is byte-identical to a block already in
-        # the file -- two clock phases with the same duty, a bus whose bits
-        # carry the same code -- and points at that block with a trailing
-        # `<back_offset>.<length>` field: the block starts `back_offset` bytes
-        # before this chunk header and its compressed size is `length`.
-        # Filling zeros here silently replaces a real waveform with a flat
-        # line, and only for signals that happen to duplicate another one.
-        if chunk_size == 0:
-            if 0 <= seq < num_traces and ref:
-                try:
-                    back = int(ref.split('.')[0], 16)
-                    src = offset - back
-                    if src >= 0:
-                        cbytes = struct.unpack_from('<I', data, src + 12)[0]
-                        vals = np.frombuffer(
-                            _blosc_decompress(data[src:src + cbytes]),
-                            dtype='<f8')
-                        if len(vals) == num_points:
-                            all_signals[seq].append(vals)
-                            continue
-                except Exception:
-                    pass
-            warnings.warn(
-                "psfxl chunk for signal {} at offset {} (flag {!r}, ref {!r}) "
-                "has zero size and its back-reference could not be resolved; "
-                "the signal is left short rather than filled with zeros"
-                .format(seq, offset, flag, ref),
-                RuntimeWarning)
+        if time[-1] <= end:
+            covered.append((kind, time[0]))
             continue
+        keep = slice(None)
+        if time[0] <= end:
+            first = int(np.searchsorted(time, end, side='right'))
+            keep = slice(first, None)
+            trimmed += 1
+        all_time.append(time[keep])
+        for i in range(num_traces):
+            all_signals[i].append(sigs[i][keep])
+        end = time[-1]
 
-        # Handle 8-byte constant chunks: DC value stored as a single raw
-        # little-endian double, preceded by alignment null padding.
-        # The padding length is exactly (8 - data_start % 8) % 8 bytes
-        # (1–8 bytes to reach the next 8-byte file offset boundary).
-        # We must NOT skip all null bytes because:
-        #   (a) signals with a DC value of 0.0 have all-zero payload bytes
-        #       that are indistinguishable from padding, and
-        #   (b) the next chunk header starts with a \x00 byte that would
-        #       also be consumed, causing us to read ASCII header text as
-        #       a double and produce garbage (~1.9×10^185).
-        # Using alignment arithmetic (1–8 bytes) avoids both pitfalls.
-        # NOTE: align_skip is always 8 - (data_start % 8), i.e. 1–8 bytes,
-        # NEVER 0.  When data_start is already 8-byte aligned, Spectre still
-        # emits a full 8-byte null pad before the value; the outer % 8 in
-        # (8 - x) % 8 would collapse this to 0 and read the padding as 0.0.
-        # Must be caught before the blosc search because the nearest blosc
-        # block (a different signal) may fall within the 128-byte search
-        # window, causing data to be mis-assigned to this signal.
-        if chunk_size == 8 and seq < num_traces:
-            align_skip = 8 - (data_start % 8)  # always 1–8, never 0
-            val_start = data_start + align_skip
-            if val_start + 8 <= len(data):
-                val = struct.unpack('<d', data[val_start:val_start + 8])[0]
-                all_signals[seq].append(np.full(num_points, val, dtype='<f8'))
-            continue
-
-        # Find blosc header after text header.
-        # Pass expected_nbytes = num_points * 8 so the search fingerprints the
-        # correct block by its uncompressed size rather than relying on the
-        # BLOSC_MAGIC flag/versionlz bytes, which can differ across compressors
-        # and shuffle modes and were what caused silent skips on numcodecs 0.9.1.
-        expected_nbytes = num_points * 8
-        blosc_pos = _find_blosc_header(data, data_start, data_start + 1280, expected_nbytes)
-        if blosc_pos == -1:
-            continue
-
-        try:
-            if seq == 0:
-                # First chunk of flush: time sweep + first trace signal
-                h0 = struct.unpack('<4B3I', data[blosc_pos:blosc_pos+16])
-                try:
-                    dec0 = _blosc_decompress(data[blosc_pos:blosc_pos+h0[6]])
-                    time_vals = np.frombuffer(dec0, dtype='<f8')
-                    # Validate that we got the expected number of points
-                    if len(time_vals) == num_points:
-                        all_time.append(time_vals)
-                    elif _NUMCODECS_OLD_VERSION:
-                        warnings.warn(
-                            f"Blosc decompression produced {len(time_vals)} points "
-                            f"but expected {num_points}. Numcodecs {_NUMCODECS_VERSION} "
-                            f"may have truncation issues.",
-                            RuntimeWarning
-                        )
-                        all_time.append(time_vals)
-                    else:
-                        continue
-                except Exception as e:
-                    if _NUMCODECS_OLD_VERSION:
-                        warnings.warn(
-                            f"Failed to decompress time data: {e}. "
-                            f"Numcodecs {_NUMCODECS_VERSION} may be unstable. "
-                            f"Consider upgrading to >= 0.16.0",
-                            RuntimeWarning
-                        )
-                    continue
-
-                # Locate the second blosc block (signal 0).
-                # It nominally sits at blosc_pos + h0[6], but there may be
-                # padding bytes between the two blocks (alignment to 8 or 16
-                # bytes, null terminators, etc.).  Search forward from the
-                # nominal position within a small window rather than requiring
-                # an exact offset.  Use the expected uncompressed size as the
-                # fingerprint so we don't mis-pick an unrelated block.
-                sig_expected_nbytes = num_points * 8
-                sig_start_nominal = blosc_pos + h0[6]
-                # Trace 0 rides in this chunk after the time block, encoded the
-                # same way any signal is. When it is constant Spectre stores a
-                # single inline double rather than a blosc block, and the
-                # declared chunk size exceeds the time block by exactly 8
-                # bytes. Searching only for a blosc header misses that and
-                # drops trace 0 with no diagnostic.
-                if chunk_size - h0[6] == 8:
-                    val = struct.unpack_from('<d', data, sig_start_nominal)[0]
-                    all_signals[0].append(np.full(num_points, val, dtype='<f8'))
-                    flush_count += 1
-                    continue
-                sig_start = _find_blosc_header(
-                    data, sig_start_nominal, sig_start_nominal + 32, sig_expected_nbytes
-                )
-                if sig_start != -1:
-                    try:
-                        h1 = struct.unpack('<4B3I', data[sig_start:sig_start+16])
-                        dec1 = _blosc_decompress(data[sig_start:sig_start+h1[6]])
-                        sig_vals = np.frombuffer(dec1, dtype='<f8')
-                        if len(sig_vals) == num_points:
-                            all_signals[0].append(sig_vals)
-                        elif _NUMCODECS_OLD_VERSION:
-                            warnings.warn(
-                                f"Blosc decompression produced {len(sig_vals)} points "
-                                f"but expected {num_points} for signal 0.",
-                                RuntimeWarning
-                            )
-                            all_signals[0].append(sig_vals)
-                    except Exception as e:
-                        if _NUMCODECS_OLD_VERSION:
-                            warnings.warn(
-                                f"Failed to decompress signal 0: {e}",
-                                RuntimeWarning
-                            )
-
-                flush_count += 1
-            else:
-                # Single signal frame
-                h = struct.unpack('<4B3I', data[blosc_pos:blosc_pos+16])
-                try:
-                    dec = _blosc_decompress(data[blosc_pos:blosc_pos+h[6]])
-                    sig_vals = np.frombuffer(dec, dtype='<f8')
-                    sig_idx = seq
-                    # Validate expected points
-                    if len(sig_vals) == num_points and sig_idx < num_traces:
-                        all_signals[sig_idx].append(sig_vals)
-                    elif sig_idx < num_traces and _NUMCODECS_OLD_VERSION:
-                        warnings.warn(
-                            f"Blosc decompression produced {len(sig_vals)} points "
-                            f"but expected {num_points} for signal {sig_idx}.",
-                            RuntimeWarning
-                        )
-                        all_signals[sig_idx].append(sig_vals)
-                except Exception as e:
-                    if _NUMCODECS_OLD_VERSION:
-                        warnings.warn(
-                            f"Failed to decompress signal {seq}: {e}",
-                            RuntimeWarning
-                        )
-                    pass
-        except Exception as e:
-            if _NUMCODECS_OLD_VERSION:
-                warnings.warn(
-                    f"Error processing chunk at seq={seq}: {e}. "
-                    f"Numcodecs {_NUMCODECS_VERSION} may be unstable.",
-                    RuntimeWarning
-                )
-            continue
-
-    # Pass 3: find and process type-2 chunks (uncompressed flush chunks).
-    #
-    # type-2 chunks come in two flavours:
-    #   Final flush  — written after all type-3 blocks, contains data not yet
-    #                  compressed; first time value > last type-3 time.
-    #   Intermediate — periodic in-flight checkpoint written while the
-    #                  simulation was still running; the same data was
-    #                  subsequently compressed into type-3 blocks, so the
-    #                  chunk is redundant; first time value <= last type-3 time.
-    #
-    # _filter_type2_chunks classifies each candidate by peeking at its first
-    # time value and comparing it to the decoded type-3 range.  This is a
-    # purely data-driven check — it makes no assumptions about file layout or
-    # byte offsets and is therefore robust to any ordering Spectre may use.
-    # Type-1 chunks carry the same grouped payload as type-2 and are
-    # classified by the same first-time-value rule, so both are gathered
-    # here and filtered together.
-    type2_candidates = _find_type2_chunks(data) + _find_type1_chunks(data)
-    last_t3_time = all_time[-1][-1] if all_time else -np.inf
-    type2_chunks, skipped_times = _filter_type2_chunks(type2_candidates, data, last_t3_time)
-
-    if skipped_times:
+    bad_chunks.warn(data_path, "signal block(s) could not be decoded and are NaN")
+    dropped.warn(data_path, "flush(es) were dropped because their time block "
+                            "could not be decoded")
+    if covered or trimmed:
+        kinds = ', '.join(f"{sum(1 for k, _ in covered if k == kind)} {kind}"
+                          for kind in ('t1', 't2', 't3')
+                          if any(k == kind for k, _ in covered))
         warnings.warn(
-            f"{len(skipped_times)} type-2 intermediate checkpoint chunk(s) were "
-            f"skipped because their simulation time(s) "
-            f"({', '.join(f'{t:.4e} s' for t in skipped_times)}) fall within the "
-            f"type-3 compressed data range (last type-3 time: {last_t3_time:.4e} s). "
-            f"This is expected when a simulation was interrupted before completing — "
-            f"the checkpoint data is already captured in the compressed type-3 blocks.",
-            UserWarning,
-            stacklevel=3,
-        )
-
-    for doubles_start, nt2, npts2, bsize2 in type2_chunks:
-        doubles = np.frombuffer(data[doubles_start:doubles_start+bsize2], dtype='<f8')
-        groups = doubles.reshape(nt2 + 1, npts2)
-        all_time.append(groups[0])
-        for sig_idx in range(min(nt2, num_traces)):
-            all_signals[sig_idx].append(groups[1 + sig_idx])
-        flush_count += 1
+            f"psfxl: {len(covered)} flush(es) ({kinds or 'none'}) were skipped "
+            f"and {trimmed} trimmed in {data_path} because their simulation "
+            f"time was already covered by earlier data in the file (first "
+            f"skipped times: {', '.join(f'{t:.4e} s' for _, t in covered[:5])}). "
+            f"Checkpoint records of an interrupted simulation look like this.",
+            UserWarning, stacklevel=2)
+    if masked:
+        warnings.warn(
+            f"psfxl: {masked} type-1/type-2 record header(s) in {data_path} lie "
+            f"inside type-3 payloads and were ignored as chance byte matches.",
+            UserWarning, stacklevel=2)
 
     if not all_time:
-        # Every earlier branch that drops a chunk does so with `continue`,
-        # so an unrecognised container leaves us here with nothing and no
-        # other diagnostic.  Returning an empty array quietly is the worst
-        # outcome: the caller sees a well-formed PSF with correct signal
-        # names and every ordinate empty, and computes on it.
+        # Returning an empty array quietly is the worst outcome: the caller
+        # sees a well-formed PSF with correct signal names and every ordinate
+        # empty, and computes on it.
         warnings.warn(
             "psfxl: no decodable waveform chunks found in {} ({} bytes). "
             "The file was parsed but contained no type-1, type-2 or type-3 "
             "data block this decoder recognises, so the result is empty "
             "rather than wrong. Check the chunk markers before trusting "
             "any measurement taken from it.".format(data_path, len(data)),
-            RuntimeWarning, stacklevel=3)
+            RuntimeWarning, stacklevel=2)
+        return np.array([]), {}, 0
 
-    # Concatenate arrays
-    time_full = np.concatenate(all_time) if all_time else np.array([])
-    signals = {}
-    for idx in range(num_traces):
-        if all_signals[idx]:
-            signals[idx] = np.concatenate(all_signals[idx])
-
-    return time_full, signals, flush_count
+    time_full = np.concatenate(all_time)
+    signals = {i: np.concatenate(all_signals[i]) for i in range(num_traces)}
+    return time_full, signals, len(all_time)
