@@ -455,7 +455,11 @@ class PSF:
         # intermediate type-2 checkpoint chunks) so they can be stored on
         # the PSF object and re-emitted on future cache hits.
         with open(path, 'rb') as _fh:
-            _magic = struct.unpack('>I', _fh.read(4))[0]
+            _head = _fh.read(4)
+        if len(_head) < 4:
+            raise ValueError(f"{path}: truncated or corrupt PSF file "
+                             f"({len(_head)} bytes)")
+        _magic = struct.unpack('>I', _head)[0]
 
         self._strings = {}
         with warnings.catch_warnings(record=True) as _wlist:

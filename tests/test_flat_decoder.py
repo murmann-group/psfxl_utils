@@ -117,3 +117,35 @@ def test_truncated_info_file_raises(tmp_path):
     p.write_bytes(b'\x00\x00\x05')
     with pytest.raises(ValueError, match='truncated'):
         decode_psf_info(p)
+
+
+def _minimal_flat(trailer):
+    """A flat file with intact sections, no traces, with/without trailer."""
+    body = struct.pack('>III', 0x200, 0, 12)
+    body += struct.pack('>II', 0x15, 12 + 16) + b'\x00' * 8
+    if trailer:
+        # offset table (its second word points back, ending the section
+        # walk, as in real files), then the marker
+        body += struct.pack('>II', 0x15, 12) + b'Clarissa' + struct.pack('>I', 8)
+    return body
+
+
+def test_traceless_file_without_trailer_is_truncated(tmp_path):
+    from psfxl_utils.psf_parse import parse_psf_header
+    p = tmp_path / 'ac.ac'
+    p.write_bytes(_minimal_flat(trailer=False))
+    with pytest.raises(ValueError, match='truncated'):
+        parse_psf_header(p)
+    p.write_bytes(_minimal_flat(trailer=True))      # complete, just no traces
+    assert parse_psf_header(p)['traces'] == []
+
+
+@pytest.mark.parametrize('size', [0, 3])
+def test_tiny_file_through_psf_is_a_value_error(tmp_path, monkeypatch, size):
+    from psfxl_utils import PSF, psf_class
+    monkeypatch.setenv('PSFXL_UTILS_CACHE_DIR', str(tmp_path / 'c'))
+    monkeypatch.setattr(psf_class.PSF, '_instance_cache', {})
+    p = tmp_path / 'dcOp.dc'
+    p.write_bytes(b'\x00\x00\x05'[:size])
+    with pytest.raises(ValueError, match='truncated'):
+        PSF(str(p))

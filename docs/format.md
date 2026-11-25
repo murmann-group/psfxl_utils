@@ -20,6 +20,12 @@ The first 4 bytes of the header file select the format:
 | `0x00000200` | Flat PSF | `ac.ac`, `noise.noise`, `dc.dc`, `stb.stb` | `flat_psf_decoder` |
 | `0x00000500` | Info / op-point | `dcOp.dc`, `dcOpInfo.info`, `element.info`, … | `oppoint_psf_decoder` |
 
+Classic *windowed* binary PSF also uses magic `0x400`, with the data in the
+header file itself and a non-zero `PSF window size` header property (PSFXL
+headers carry that property with value 0). Spectre writes some results this
+way even under `-format psfxl`, e.g. PSS time-domain `.td.pss` files; they are
+rejected with a `ValueError`.
+
 Not every file in a Spectre psf directory is binary PSF: some `.info` files
 (e.g. `designParamVals.info`, which begins with ASCII `HEAD`) are plain text
 and are rejected with a `ValueError`.

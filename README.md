@@ -124,7 +124,7 @@ print(f"Vgs = {vgs:.4f} V")
 stb = PSF('results/psf/stb.margin.stb')
 print(stb.get_signal('phaseMargin').ordinate[0], stb.get_string('stb_state'))
 
-for signal in psf.all_signals():
+for signal in dev.all_signals():
     print(f'{signal.name:<20} {signal.ordinate[0]:<12.6g} '
           f'{signal.units:<8} {signal.type.kind}')
 ```

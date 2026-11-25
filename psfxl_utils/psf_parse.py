@@ -329,11 +329,18 @@ def parse_psf_header(header_path):
             if _grp_eid >= 0 and _grp_comps:
                 group_type_components[_grp_eid] = list(_grp_comps)
 
-            if is_flat and truncated and not traces:
+            # A cut exactly at a section boundary leaves every remaining
+            # section intact (not 'truncated'), but then the TRACE section is
+            # taken for VALUE and no traces are found.  A complete flat file
+            # always ends with the 12-byte trailer b'Clarissa' + u32, so a
+            # trace-less file without it was cut short.  (Complete files with
+            # no traces, e.g. sweep index files, keep their trailer.)
+            if is_flat and not traces and (
+                    truncated or data[file_end - 12:file_end - 4] != b'Clarissa'):
                 raise ValueError(
-                    f"{header_path}: truncated PSF file: it ends inside its "
-                    f"metadata sections ({file_end} bytes), so no signals can "
-                    f"be named")
+                    f"{header_path}: truncated PSF file: it ends inside or "
+                    f"just after its metadata sections ({file_end} bytes), so "
+                    f"no signals can be named")
 
             return {
                 'value_section': value_section,

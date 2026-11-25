@@ -89,7 +89,10 @@ noise components.
 
 **Truncated files.** Sections are walked by one helper
 (`psf_parse.section_chain`) shared by the header parser and the decoders.
-If a flat file's last section runs past the end of the file, it is taken as
+A complete flat or operating-point file ends with a 12-byte trailer
+(`Clarissa` + u32); a flat file that names no traces and lacks it was cut at a
+section boundary and raises `ValueError`. If a flat file's last section runs
+past the end of the file, it is taken as
 the VALUE section (checked: the complete sections before it must name the
 traces), and only the header-derived layout is used: the complete sweep points
 are returned with a `RuntimeWarning`, and a file cut inside its first point or
@@ -143,8 +146,8 @@ Two transparent layers, both managed by `PSF.__init__`:
 | Disk (across sessions) | `$PSFXL_UTILS_CACHE_DIR/*.pkl`, default `~/.cache/psfxl_utils/*.pkl` | source fingerprint **and** library source hash, both in the entry name |
 
 **Source fingerprint.** `psf_cache.source_fingerprint()` hashes the header
-file's mtime (ns), size, inode and ctime, plus the mtime, size and inode of
-the `<header>.psfxl` data file when there is one. A PSFXL result is two files
+file's mtime (ns), size, inode and ctime, plus the same four for the
+`<header>.psfxl` data file when there is one. A PSFXL result is two files
 and either can change alone (a running simulation appends to the data file),
 so both are covered. ctime catches copies that preserve mtime and size
 (`cp -p`, `rsync -t`); metadata-only changes such as chmod or rename also
@@ -157,7 +160,7 @@ and the disk key once, before it decodes. After decoding, the result is
 saved to disk and registered in memory only if the source files still match
 those keys. Otherwise (a simulation still writing, a re-run that finished
 mid-decode) the result may not match the file now on disk, so it is not
-cached, and a `PSFCacheWarning` says so.
+cached; when the disk cache is in use, a `PSFCacheWarning` says so.
 
 **Disk layer.** Entry names have the form
 `<stem>_<path-md5-prefix>_<lib-hash>_<fingerprint>.pkl`, with the stem cut to
